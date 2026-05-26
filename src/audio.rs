@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -5,8 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ffmpeg_next as ffmpeg;
+use ffmpeg::format::sample::{Sample, Type as SampleType};
+use ffmpeg::media::Type as MediaType;
+use ffmpeg::software::resampling::Context as Resampler;
+use ffmpeg::util::frame::audio::Audio;
+use ffmpeg::ChannelLayout;
 use rodio::source::Source;
 use rodio::{ChannelCount, Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, SampleRate};
+
+use crate::library;
 
 const TAP_CAPACITY: usize = 8192;
 
@@ -175,6 +184,201 @@ impl SampleBuffer {
     }
 }
 
+/// Audio source backed by an ffmpeg input. Used when playing video files
+/// (and also as a generic fallback for audio formats rodio's symphonia layer
+/// doesn't accept). Pulls and demuxes lazily so the decode work happens on
+/// rodio's playback thread.
+pub struct FfmpegAudioSource {
+    ictx: ffmpeg::format::context::Input,
+    decoder: ffmpeg::codec::decoder::Audio,
+    resampler: Resampler,
+    stream_index: usize,
+    out_channels: u16,
+    out_rate: u32,
+    duration: Option<Duration>,
+    buffer: VecDeque<f32>,
+    finished: bool,
+}
+
+impl FfmpegAudioSource {
+    pub fn open(path: &Path) -> Result<Self> {
+        ffmpeg::init().ok();
+        let ictx = ffmpeg::format::input(&path.to_path_buf())
+            .with_context(|| format!("opening {}", path.display()))?;
+        let stream = ictx
+            .streams()
+            .best(MediaType::Audio)
+            .context("file has no audio stream")?;
+        let stream_index = stream.index();
+        let time_base = stream.time_base();
+        let duration = {
+            let dur = stream.duration();
+            if dur > 0 {
+                Some(Duration::from_secs_f64(
+                    dur as f64 * time_base.numerator() as f64 / time_base.denominator() as f64,
+                ))
+            } else {
+                let d = ictx.duration();
+                if d > 0 {
+                    Some(Duration::from_secs_f64(
+                        d as f64 / ffmpeg::ffi::AV_TIME_BASE as f64,
+                    ))
+                } else {
+                    None
+                }
+            }
+        };
+
+        let codec_ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())?;
+        let decoder = codec_ctx.decoder().audio()?;
+
+        let in_rate = decoder.rate();
+        let in_channels = decoder.channels();
+        let in_layout = if decoder.channel_layout() == ChannelLayout::default(0) {
+            ChannelLayout::default(in_channels as i32)
+        } else {
+            decoder.channel_layout()
+        };
+        let in_format = decoder.format();
+
+        let out_rate: u32 = if in_rate == 0 { 44_100 } else { in_rate };
+        let out_layout = ChannelLayout::STEREO;
+        let out_channels: u16 = 2;
+
+        let resampler = Resampler::get(
+            in_format,
+            in_layout,
+            in_rate.max(1),
+            Sample::F32(SampleType::Packed),
+            out_layout,
+            out_rate,
+        )
+        .context("creating audio resampler")?;
+
+        Ok(Self {
+            ictx,
+            decoder,
+            resampler,
+            stream_index,
+            out_channels,
+            out_rate,
+            duration,
+            buffer: VecDeque::with_capacity(8192),
+            finished: false,
+        })
+    }
+
+    /// Seek the underlying input to `target` and reset decoder state.
+    pub fn seek(&mut self, target: Duration) -> Result<()> {
+        let ts = (target.as_micros() as i64) * (ffmpeg::ffi::AV_TIME_BASE as i64) / 1_000_000;
+        self.ictx.seek(ts, ..ts).ok();
+        self.decoder.flush();
+        self.buffer.clear();
+        self.finished = false;
+        Ok(())
+    }
+
+    fn drain_decoder(&mut self) {
+        let mut decoded = Audio::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            let mut resampled = Audio::empty();
+            if self.resampler.run(&decoded, &mut resampled).is_err() {
+                continue;
+            }
+            self.append_samples(&resampled);
+        }
+    }
+
+    fn append_samples(&mut self, frame: &Audio) {
+        let samples = frame.samples();
+        if samples == 0 {
+            return;
+        }
+        // ffmpeg-next's `plane::<T>(0)` returns only `nb_samples` elements,
+        // which is wrong for packed (interleaved) formats — packed stereo
+        // actually has `nb_samples * channels` floats in plane 0. Read raw
+        // bytes via `data(0)` (linesize-sized) and reinterpret as f32 so we
+        // pick up every sample.
+        let bytes = frame.data(0);
+        let needed_bytes = samples
+            .saturating_mul(self.out_channels as usize)
+            .saturating_mul(std::mem::size_of::<f32>());
+        let usable = bytes.len().min(needed_bytes);
+        if usable < std::mem::size_of::<f32>() {
+            return;
+        }
+        // SAFETY: ffmpeg audio buffers are guaranteed to be aligned for the
+        // sample type (4-byte aligned for f32) and `usable` is a multiple of
+        // sizeof(f32) by construction.
+        let n_f32 = usable / std::mem::size_of::<f32>();
+        let interleaved: &[f32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n_f32)
+        };
+        self.buffer.extend(interleaved.iter().copied());
+    }
+
+    fn fill_buffer(&mut self) {
+        while self.buffer.is_empty() && !self.finished {
+            // Try to receive any frames already buffered inside the decoder.
+            let mut decoded = Audio::empty();
+            match self.decoder.receive_frame(&mut decoded) {
+                Ok(()) => {
+                    let mut resampled = Audio::empty();
+                    if self.resampler.run(&decoded, &mut resampled).is_ok() {
+                        self.append_samples(&resampled);
+                    }
+                    continue;
+                }
+                Err(ffmpeg::Error::Other { errno })
+                    if errno == ffmpeg::util::error::EAGAIN => {}
+                Err(_) => {
+                    // Decoder error — try to keep going with more packets.
+                }
+            }
+
+            // Need more packets.
+            let mut packet = ffmpeg::Packet::empty();
+            match packet.read(&mut self.ictx) {
+                Ok(()) => {
+                    if packet.stream() == self.stream_index {
+                        let _ = self.decoder.send_packet(&packet);
+                    }
+                }
+                Err(_) => {
+                    let _ = self.decoder.send_eof();
+                    self.drain_decoder();
+                    self.finished = true;
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for FfmpegAudioSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.buffer.is_empty() {
+            self.fill_buffer();
+        }
+        self.buffer.pop_front()
+    }
+}
+
+impl Source for FfmpegAudioSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::new(self.out_channels).unwrap_or(ChannelCount::new(2).unwrap())
+    }
+    fn sample_rate(&self) -> SampleRate {
+        SampleRate::new(self.out_rate).unwrap_or(SampleRate::new(44_100).unwrap())
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.duration
+    }
+}
+
 struct TapSource<S> {
     inner: S,
     tap: SampleBuffer,
@@ -250,12 +454,21 @@ impl AudioPlayer {
         self.tap.reset();
         self.current_path = Some(path.to_path_buf());
 
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let source = Decoder::new(BufReader::new(file))
-            .with_context(|| format!("decoding {}", path.display()))?;
-        let total = source.total_duration();
-        let tapped = TapSource::new(source, self.tap.clone());
-        self.player.append(tapped);
+        let total = if library::is_video_file(path) {
+            let source = FfmpegAudioSource::open(path)?;
+            let total = source.total_duration();
+            let tapped = TapSource::new(source, self.tap.clone());
+            self.player.append(tapped);
+            total
+        } else {
+            let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+            let source = Decoder::new(BufReader::new(file))
+                .with_context(|| format!("decoding {}", path.display()))?;
+            let total = source.total_duration();
+            let tapped = TapSource::new(source, self.tap.clone());
+            self.player.append(tapped);
+            total
+        };
         self.player.play();
         Ok(total)
     }
@@ -282,14 +495,21 @@ impl AudioPlayer {
         self.player = Player::connect_new(self.sink.mixer());
         self.player.set_volume(self.volume);
 
-        let file = File::open(path)?;
-        let source = Decoder::new(BufReader::new(file))?;
-        let skipped = source.skip_duration(target);
-
         self.tap.reset();
         self.tap.set_base_offset(target);
-        let tapped = TapSource::new(skipped, self.tap.clone());
-        self.player.append(tapped);
+
+        if library::is_video_file(path) {
+            let mut source = FfmpegAudioSource::open(path)?;
+            source.seek(target)?;
+            let tapped = TapSource::new(source, self.tap.clone());
+            self.player.append(tapped);
+        } else {
+            let file = File::open(path)?;
+            let source = Decoder::new(BufReader::new(file))?;
+            let skipped = source.skip_duration(target);
+            let tapped = TapSource::new(skipped, self.tap.clone());
+            self.player.append(tapped);
+        }
 
         if was_paused {
             self.player.pause();

@@ -7,6 +7,9 @@ use walkdir::WalkDir;
 pub const SUPPORTED_EXTS: &[&str] = &[
     "mp3", "wav", "ogg", "flac", "m4a", "aac", "opus", "wma",
 ];
+pub const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mkv", "avi", "mov", "webm", "m4v",
+];
 pub const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8", "pls"];
 
 #[derive(Debug, Clone)]
@@ -26,7 +29,11 @@ impl Track {
 }
 
 pub fn is_audio_file(path: &Path) -> bool {
-    has_ext(path, SUPPORTED_EXTS)
+    has_ext(path, SUPPORTED_EXTS) || has_ext(path, VIDEO_EXTS)
+}
+
+pub fn is_video_file(path: &Path) -> bool {
+    has_ext(path, VIDEO_EXTS)
 }
 
 pub fn is_playlist_file(path: &Path) -> bool {

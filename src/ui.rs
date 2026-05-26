@@ -32,7 +32,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     if app.fullscreen_vis {
-        draw_visualizer(frame, outer[0], app);
+        if app.video_protocol.is_some() {
+            draw_video(frame, outer[0], app);
+        } else {
+            draw_visualizer(frame, outer[0], app);
+        }
         draw_footer(frame, outer[1], app);
         if app.show_help {
             draw_help(frame, area);
@@ -53,23 +57,41 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_playlist(frame, left[0], app);
     draw_browser(frame, left[1], app);
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(16), Constraint::Min(8)])
-        .split(body[1]);
+    let has_video = app.video_protocol.is_some();
 
-    let has_art = app.album_protocol.is_some();
-    if has_art {
-        let top_row = Layout::default()
+    if has_video {
+        // Video gets the larger half of the right column; metadata + visualizer
+        // share the bottom.
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(16)])
+            .split(body[1]);
+        draw_video(frame, right[0], app);
+        let bottom = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
-            .split(right[0]);
-        draw_album_art(frame, top_row[0], app);
-        draw_now_playing(frame, top_row[1], app);
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(right[1]);
+        draw_now_playing(frame, bottom[0], app);
+        draw_visualizer(frame, bottom[1], app);
     } else {
-        draw_now_playing(frame, right[0], app);
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(16), Constraint::Min(8)])
+            .split(body[1]);
+
+        let has_art = app.album_protocol.is_some();
+        if has_art {
+            let top_row = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+                .split(right[0]);
+            draw_album_art(frame, top_row[0], app);
+            draw_now_playing(frame, top_row[1], app);
+        } else {
+            draw_now_playing(frame, right[0], app);
+        }
+        draw_visualizer(frame, right[1], app);
     }
-    draw_visualizer(frame, right[1], app);
 
     draw_footer(frame, outer[1], app);
 
@@ -535,6 +557,57 @@ fn draw_album_art(frame: &mut Frame, area: Rect, app: &mut App) {
     let fit_h_px = (ih as f64 * scale).round() as u32;
 
     // Round up to whole cells so the image doesn't get truncated at the edges.
+    let cells_w = ((fit_w_px + font_w as u32 - 1) / font_w.max(1) as u32)
+        .max(1)
+        .min(inner.width as u32) as u16;
+    let cells_h = ((fit_h_px + font_h as u32 - 1) / font_h.max(1) as u32)
+        .max(1)
+        .min(inner.height as u32) as u16;
+
+    let x = inner.x + (inner.width - cells_w) / 2;
+    let y = inner.y + (inner.height - cells_h) / 2;
+    let img_area = Rect::new(x, y, cells_w, cells_h);
+    frame.render_stateful_widget(StatefulImage::default(), img_area, proto);
+}
+
+fn draw_video(frame: &mut Frame, area: Rect, app: &mut App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(NEON_PURPLE))
+        .title(Line::from(Span::styled(
+            " Video ",
+            Style::default().fg(NEON_YELLOW).add_modifier(Modifier::BOLD),
+        )))
+        .style(Style::default().bg(BG_PANEL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let font_size = app
+        .picker
+        .as_ref()
+        .map(|p| p.font_size())
+        .unwrap_or(ratatui_image::FontSize::new(8, 16));
+    let font_w = font_size.width;
+    let font_h = font_size.height;
+    let dims = app.video_dims;
+
+    let Some(proto) = app.video_protocol.as_mut() else {
+        return;
+    };
+    let (iw, ih) = dims.unwrap_or((1, 1));
+    let iw = iw.max(1);
+    let ih = ih.max(1);
+
+    let avail_w_px = inner.width as u32 * font_w.max(1) as u32;
+    let avail_h_px = inner.height as u32 * font_h.max(1) as u32;
+
+    let scale = (avail_w_px as f64 / iw as f64).min(avail_h_px as f64 / ih as f64);
+    let fit_w_px = (iw as f64 * scale).round() as u32;
+    let fit_h_px = (ih as f64 * scale).round() as u32;
+
     let cells_w = ((fit_w_px + font_w as u32 - 1) / font_w.max(1) as u32)
         .max(1)
         .min(inner.width as u32) as u16;
@@ -1558,6 +1631,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         Line::from("  ← / →          seek -10s / +10s"),
         Line::from("  Ctrl+← / Ctrl+→  seek -30s / +30s"),
         Line::from("  + / = / -      volume up / up / down"),
+        Line::from("  [ / ]          A/V sync offset -25ms / +25ms (video)"),
         Line::from("  Enter          play selection"),
         Line::from(""),
         Line::from(Span::styled(

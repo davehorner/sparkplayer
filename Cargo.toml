@@ -25,6 +25,7 @@ lofty = "0.24"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm", "image-defaults"] }
 walkdir = "2"
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 
 [profile.release]
 opt-level = 3
@@ -33,13 +34,15 @@ lto = "thin"
 [package.metadata.deb]
 section = "sound"
 priority = "optional"
-depends = "libasound2"
+depends = "libasound2, libavcodec60 | libavcodec59, libavformat60 | libavformat59, libavutil58 | libavutil57, libswresample4, libswscale7 | libswscale6"
 extended-description = """\
-SparkPlayer is a lightweight terminal music player.
-It supports MP3, WAV, OGG, FLAC, M4A, AAC, Opus and WMA playback,
-M3U/M3U8/PLS playlists, embedded album art, and a colorful visualizer
-with FFT bars, waveform, scrolling waveform, spectrogram, stereo X/Y
-oscillogram and a pseudo-3D spectrum view."""
+SparkPlayer is a lightweight terminal media player.
+It supports MP3, WAV, OGG, FLAC, M4A, AAC, Opus and WMA audio plus
+MP4, MKV, AVI, MOV, WebM and M4V video playback (rendered in-terminal
+via Kitty/Sixel/iTerm graphics or halfblocks), M3U/M3U8/PLS playlists,
+embedded album art, and a colorful visualizer with FFT bars, waveform,
+scrolling waveform, spectrogram, stereo X/Y oscillogram, pseudo-3D
+spectrum and a cassette-tape view."""
 assets = [
     ["target/release/sparkplayer", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/sparkplayer/README.md", "644"],

@@ -9,7 +9,18 @@ use ratatui_image::protocol::StatefulProtocol;
 use crate::audio::AudioPlayer;
 use crate::library::{self, Track};
 use crate::metadata::{self, TrackMeta};
+use crate::video::VideoStream;
 use crate::visualizer::Visualizer;
+
+/// Default latency between the audio "consumed by mixer" timestamp (what
+/// `app.position()` reports via the tap) and what's actually being heard from
+/// the speakers. The tap counts samples that have been pulled from the source
+/// — those samples then sit in rodio's output ring buffer (typically
+/// 100-400ms, backend-dependent) before they hit DAC. Video frames are
+/// timestamped on the audio clock, so we subtract this offset before picking
+/// the frame to display. Tunable at runtime with `[` / `]`.
+const DEFAULT_AV_OFFSET_SECS: f64 = 0.30;
+pub const AV_OFFSET_STEP_SECS: f64 = 0.025;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum FocusPane {
@@ -90,6 +101,11 @@ pub struct App {
     pub album_dims: Option<(u32, u32)>,
     pub last_artwork_key: Option<(usize, usize)>,
 
+    pub video: Option<VideoStream>,
+    pub video_protocol: Option<StatefulProtocol>,
+    pub video_dims: Option<(u32, u32)>,
+    pub av_offset_secs: f64,
+
     pub should_quit: bool,
     pub show_help: bool,
     pub fullscreen_vis: bool,
@@ -130,6 +146,10 @@ impl App {
             album_protocol: None,
             album_dims: None,
             last_artwork_key: None,
+            video: None,
+            video_protocol: None,
+            video_dims: None,
+            av_offset_secs: DEFAULT_AV_OFFSET_SECS,
             should_quit: false,
             show_help: false,
             fullscreen_vis: false,
@@ -318,6 +338,11 @@ impl App {
                 self.current_meta.artwork = Some(bytes);
             }
         }
+        // Tear down any previous video pipeline before swapping audio sources.
+        self.video = None;
+        self.video_protocol = None;
+        self.video_dims = None;
+
         match self.player.play_file(&path) {
             Ok(dur_hint) => {
                 self.current_duration = self.current_meta.duration.or(dur_hint);
@@ -333,6 +358,17 @@ impl App {
                         .unwrap_or_default()
                 );
                 self.refresh_album_art();
+                if library::is_video_file(&path) {
+                    match VideoStream::open(&path) {
+                        Ok(v) => {
+                            self.video_dims = Some((v.width, v.height));
+                            self.video = Some(v);
+                        }
+                        Err(e) => {
+                            self.status = format!("Video decode error: {e}");
+                        }
+                    }
+                }
             }
             Err(e) => {
                 self.status = format!("Decode error: {e}");
@@ -341,6 +377,34 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// Pull the latest video frame keyed to the audio output time and refresh
+    /// the on-screen image protocol if a new frame is ready.
+    pub fn tick_video(&mut self) {
+        let Some(video) = self.video.as_ref() else {
+            return;
+        };
+        if self.player.is_paused() {
+            return;
+        }
+        let pos = self.position().as_secs_f64() - self.av_offset_secs;
+        if pos < 0.0 {
+            return;
+        }
+        let Some(frame) = video.frame_at(pos) else {
+            return;
+        };
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let buf = match image::RgbImage::from_raw(frame.width, frame.height, frame.data) {
+            Some(b) => b,
+            None => return,
+        };
+        let dyn_img = image::DynamicImage::ImageRgb8(buf);
+        self.video_dims = Some((frame.width, frame.height));
+        self.video_protocol = Some(picker.new_resize_protocol(dyn_img));
     }
 
     pub fn next_track(&mut self) -> Result<()> {
@@ -391,6 +455,9 @@ impl App {
         match self.player.seek_relative(delta, total) {
             Ok(()) => {
                 let pos = self.player.tap.position();
+                if let Some(video) = self.video.as_ref() {
+                    video.seek(pos);
+                }
                 self.status = format!(
                     "Seek: {} ({:+.0}s)",
                     fmt_short(pos),
@@ -480,6 +547,9 @@ impl App {
         self.album_protocol = None;
         self.album_dims = None;
         self.last_artwork_key = None;
+        self.video = None;
+        self.video_protocol = None;
+        self.video_dims = None;
         self.status = String::from("Playlist cleared");
     }
 
@@ -546,6 +616,14 @@ impl App {
                 self.last_artwork_key = None;
             }
         }
+    }
+
+    /// Nudge the A/V sync offset. Positive `delta` pushes the picked video
+    /// frame further into the past (use when video is ahead of audio);
+    /// negative pulls it forward.
+    pub fn adjust_av_offset(&mut self, delta: f64) {
+        self.av_offset_secs = (self.av_offset_secs + delta).clamp(-0.5, 2.0);
+        self.status = format!("A/V offset: {:+.0} ms", self.av_offset_secs * 1000.0);
     }
 
     pub fn volume_step(&mut self, delta: f32) {

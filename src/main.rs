@@ -3,6 +3,7 @@ mod audio;
 mod library;
 mod metadata;
 mod ui;
+mod video;
 mod visualizer;
 
 use std::io::{self, Stdout};
@@ -19,7 +20,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, GraphicsChoice};
+use crate::app::{App, AV_OFFSET_STEP_SECS, GraphicsChoice};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum GraphicsArg {
@@ -137,6 +138,7 @@ fn run_loop(
 
         if last_tick.elapsed() >= frame_dur {
             app.check_advance()?;
+            app.tick_video();
             last_tick = Instant::now();
         }
 
@@ -185,6 +187,8 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<()> {
         KeyCode::Right => app.seek_seconds(10.0),
         KeyCode::Char('-') | KeyCode::Char('_') => app.volume_step(-0.05),
         KeyCode::Char('+') | KeyCode::Char('=') => app.volume_step(0.05),
+        KeyCode::Char('[') => app.adjust_av_offset(-AV_OFFSET_STEP_SECS),
+        KeyCode::Char(']') => app.adjust_av_offset(AV_OFFSET_STEP_SECS),
         KeyCode::Enter => app.activate_selection()?,
         _ => {}
     }
