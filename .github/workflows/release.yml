@@ -104,6 +104,13 @@ jobs:
         run: cargo install cross --locked
 
       - name: Build release binary with cross
+        env:
+          # pkg-config refuses to look up cross-arch .pc files without this.
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          # Tell bindgen which arch we are targeting so it loads the right
+          # libavutil/avconfig.h from /usr/include/<triple>/.
+          BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: "--target=aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu"
+          BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf: "--target=arm-linux-gnueabihf -I/usr/include/arm-linux-gnueabihf"
         run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Install cargo-deb
