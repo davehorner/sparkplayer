@@ -649,7 +649,13 @@ fn draw_visualizer(frame: &mut Frame, area: Rect, app: &mut App) {
         VisMode::Spectrogram => draw_spectrogram(frame, inner, app, active),
         VisMode::Lissajous => draw_lissajous(frame, inner, app, active),
         VisMode::Spectrum3D => draw_spectrum_3d(frame, inner, app, active),
-        VisMode::Cassette => draw_cassette(frame, inner, app, active),
+        VisMode::Cassette => {
+            if app.video.is_some() {
+                draw_vhs(frame, inner, app, active);
+            } else {
+                draw_cassette(frame, inner, app, active);
+            }
+        }
     }
 }
 
@@ -1067,6 +1073,408 @@ fn heatmap(t: f32) -> Color {
     }
     let (r, g, b) = stops[stops.len() - 1].1;
     Color::Rgb(r, g, b)
+}
+
+/// VHS cassette variant of the cassette visualizer, used when the current
+/// track is a video. VHS tapes are wider and thinner than compact cassettes,
+/// with two big translucent reels behind a clear window and a tape door slot
+/// along the bottom edge. Same rotating-spindle technique as the audio
+/// cassette.
+fn draw_vhs(frame: &mut Frame, area: Rect, app: &mut App, active: bool) {
+    let phase = app.visualizer.cassette_phase(&app.player.tap, active);
+    let title = app
+        .current_meta
+        .title
+        .clone()
+        .or_else(|| {
+            app.playing_index
+                .and_then(|i| app.tracks.get(i))
+                .map(|t| t.display.clone())
+        })
+        .unwrap_or_else(|| "Untitled".to_string());
+    let artist = app
+        .current_meta
+        .artist
+        .clone()
+        .unwrap_or_else(|| "Unknown Studio".to_string());
+
+    if area.width < 32 || area.height < 10 {
+        return;
+    }
+    // VHS aspect ~188:104 mm = 1.81:1. With ~2:1 cell aspect, target cells
+    // are ~3.6:1 (wide:tall). Slightly squatter than compact cassette.
+    let target_w: u16 = 64;
+    let w = target_w.min(area.width);
+    let target_h = ((w as u32 * 28 + 50) / 100) as u16;
+    let h = target_h.clamp(10, area.height);
+    let x = area.x + (area.width - w) / 2;
+    let y = area.y + (area.height - h) / 2;
+    let body = Rect::new(x, y, w, h);
+
+    let case_color = Color::Rgb(18, 18, 22);
+    let case_trim = Color::Rgb(80, 80, 100);
+    let label_bg = Color::Rgb(240, 235, 220);
+    let label_text = Color::Rgb(25, 25, 50);
+    let label_meta = Color::Rgb(160, 50, 50);
+    let label_border = Color::Rgb(60, 60, 90);
+    let screw_color = Color::Rgb(80, 75, 100);
+    let window_frame = Color::Rgb(140, 140, 160);
+    let reel_outer = Color::Rgb(230, 230, 240);
+    let reel_inner = Color::Rgb(60, 50, 40);
+    let door_color = Color::Rgb(8, 8, 12);
+
+    let x0 = body.x;
+    let y0 = body.y;
+    let x1 = body.x + body.width - 1;
+    let y1 = body.y + body.height - 1;
+
+    // Label sits in the upper third; window with reels fills the middle; a
+    // tape-door slot runs along the bottom edge.
+    let lbl_pad_x = 4u16;
+    let lbl_top = y0 + 1;
+    let lbl_h = ((h - 4) / 3).max(2).min(4);
+    let lx0 = x0 + lbl_pad_x;
+    let lx1 = x1 - lbl_pad_x;
+    let ly0 = lbl_top;
+    let ly1 = ly0 + lbl_h;
+
+    let door_h = 2u16.min(h.saturating_sub(8));
+    let door_top = y1.saturating_sub(door_h);
+
+    let win_top = ly1 + 1;
+    let win_bot = door_top.saturating_sub(1);
+    let win_pad_x = 2u16;
+    let wx0 = x0 + win_pad_x;
+    let wx1 = x1 - win_pad_x;
+
+    // ----- structural pass: case, label, window frame, screws, door -----
+    {
+        let buf = frame.buffer_mut();
+
+        // Body fill.
+        for yi in body.y..body.y + body.height {
+            for xi in body.x..body.x + body.width {
+                if let Some(cell) = buf.cell_mut((xi, yi)) {
+                    cell.set_char(' ');
+                    cell.set_bg(case_color);
+                    cell.set_fg(case_trim);
+                }
+            }
+        }
+
+        // Square outer border — VHS shells are blocky, not rounded.
+        let corners = [
+            (x0, y0, '┌'),
+            (x1, y0, '┐'),
+            (x0, y1, '└'),
+            (x1, y1, '┘'),
+        ];
+        for (cx, cy, ch) in corners {
+            if let Some(cell) = buf.cell_mut((cx, cy)) {
+                cell.set_char(ch);
+                cell.set_fg(case_trim);
+                cell.set_bg(case_color);
+            }
+        }
+        for xi in (x0 + 1)..x1 {
+            for &cy in &[y0, y1] {
+                if let Some(cell) = buf.cell_mut((xi, cy)) {
+                    cell.set_char('─');
+                    cell.set_fg(case_trim);
+                    cell.set_bg(case_color);
+                }
+            }
+        }
+        for yi in (y0 + 1)..y1 {
+            for &cx in &[x0, x1] {
+                if let Some(cell) = buf.cell_mut((cx, yi)) {
+                    cell.set_char('│');
+                    cell.set_fg(case_trim);
+                    cell.set_bg(case_color);
+                }
+            }
+        }
+
+        // Label paper.
+        for yi in ly0..=ly1 {
+            for xi in lx0..=lx1 {
+                if let Some(cell) = buf.cell_mut((xi, yi)) {
+                    cell.set_char(' ');
+                    cell.set_bg(label_bg);
+                    cell.set_fg(label_text);
+                }
+            }
+        }
+        let lbl_corners = [
+            (lx0, ly0, '┌'),
+            (lx1, ly0, '┐'),
+            (lx0, ly1, '└'),
+            (lx1, ly1, '┘'),
+        ];
+        for (cx, cy, ch) in lbl_corners {
+            if let Some(cell) = buf.cell_mut((cx, cy)) {
+                cell.set_char(ch);
+                cell.set_fg(label_border);
+                cell.set_bg(label_bg);
+            }
+        }
+        for xi in (lx0 + 1)..lx1 {
+            for &cy in &[ly0, ly1] {
+                if let Some(cell) = buf.cell_mut((xi, cy)) {
+                    cell.set_char('─');
+                    cell.set_fg(label_border);
+                    cell.set_bg(label_bg);
+                }
+            }
+        }
+        for yi in (ly0 + 1)..ly1 {
+            for &cx in &[lx0, lx1] {
+                if let Some(cell) = buf.cell_mut((cx, yi)) {
+                    cell.set_char('│');
+                    cell.set_fg(label_border);
+                    cell.set_bg(label_bg);
+                }
+            }
+        }
+
+        // Label text. VHS labels typically read "VHS · SP · 120 min" or similar.
+        let inner_w = (lx1 - lx0).saturating_sub(2) as usize;
+        let inner_x = lx0 + 1;
+        if ly1 > ly0 + 1 {
+            let header = " ▌ VHS · SP · T-120 ▐ ";
+            write_label_centered(
+                buf, inner_x, ly0 + 1, inner_w, header, label_meta, label_bg, true,
+            );
+        }
+        if ly1 > ly0 + 2 {
+            let title_line = format!("▶ {}", truncate_chars(&title, inner_w.saturating_sub(2)));
+            write_label_centered(
+                buf,
+                inner_x,
+                ly0 + 2,
+                inner_w,
+                &title_line,
+                label_text,
+                label_bg,
+                true,
+            );
+        }
+        if ly1 > ly0 + 3 {
+            let artist_line = truncate_chars(&artist, inner_w);
+            write_label_centered(
+                buf,
+                inner_x,
+                ly0 + 3,
+                inner_w,
+                &artist_line,
+                label_meta,
+                label_bg,
+                false,
+            );
+        }
+
+        // Window frame around the reels.
+        if win_bot > win_top + 1 && wx1 > wx0 + 1 {
+            for xi in (wx0 + 1)..wx1 {
+                if let Some(cell) = buf.cell_mut((xi, win_top)) {
+                    cell.set_char('─');
+                    cell.set_fg(window_frame);
+                    cell.set_bg(case_color);
+                }
+                if let Some(cell) = buf.cell_mut((xi, win_bot)) {
+                    cell.set_char('─');
+                    cell.set_fg(window_frame);
+                    cell.set_bg(case_color);
+                }
+            }
+            for yi in (win_top + 1)..win_bot {
+                if let Some(cell) = buf.cell_mut((wx0, yi)) {
+                    cell.set_char('│');
+                    cell.set_fg(window_frame);
+                    cell.set_bg(case_color);
+                }
+                if let Some(cell) = buf.cell_mut((wx1, yi)) {
+                    cell.set_char('│');
+                    cell.set_fg(window_frame);
+                    cell.set_bg(case_color);
+                }
+            }
+            for (cx, cy, ch) in [
+                (wx0, win_top, '┌'),
+                (wx1, win_top, '┐'),
+                (wx0, win_bot, '└'),
+                (wx1, win_bot, '┘'),
+            ] {
+                if let Some(cell) = buf.cell_mut((cx, cy)) {
+                    cell.set_char(ch);
+                    cell.set_fg(window_frame);
+                    cell.set_bg(case_color);
+                }
+            }
+        }
+
+        // Tape door — a darker recessed slot across the bottom edge.
+        if door_h > 0 {
+            for yi in door_top..y1 {
+                for xi in (x0 + 2)..x1.saturating_sub(1) {
+                    if let Some(cell) = buf.cell_mut((xi, yi)) {
+                        cell.set_char('▀');
+                        cell.set_fg(door_color);
+                        cell.set_bg(Color::Rgb(40, 35, 50));
+                    }
+                }
+            }
+            // A thin tape line peeking out of the door.
+            for xi in (x0 + 4)..x1.saturating_sub(3) {
+                if let Some(cell) = buf.cell_mut((xi, door_top)) {
+                    cell.set_char('▁');
+                    cell.set_fg(Color::Rgb(150, 110, 70));
+                    cell.set_bg(case_color);
+                }
+            }
+        }
+
+        // Four corner screws.
+        let screw_positions = [
+            (x0 + 2, y0 + 1),
+            (x1 - 2, y0 + 1),
+            (x0 + 2, y1 - 1),
+            (x1 - 2, y1 - 1),
+        ];
+        for (sx, sy) in screw_positions {
+            if let Some(cell) = buf.cell_mut((sx, sy)) {
+                cell.set_char('◉');
+                cell.set_fg(screw_color);
+                cell.set_bg(case_color);
+            }
+        }
+    }
+
+    // ----- canvas pass: two large reels -----
+    let inner_w = wx1.saturating_sub(wx0).saturating_sub(1);
+    let inner_h = win_bot.saturating_sub(win_top).saturating_sub(1);
+    let inner_x = wx0 + 1;
+    let inner_y = win_top + 1;
+
+    if inner_w < 16 || inner_h < 3 {
+        return;
+    }
+
+    // VHS reels are much bigger than cassette spindles — they nearly touch.
+    let spindle_h: u16 = inner_h;
+    let spindle_w: u16 = (inner_w / 2 - 1).max(7);
+    let spindle_y = inner_y;
+
+    let quarter = inner_w / 4;
+    let three_q = (inner_w * 3) / 4;
+    let half_sw = spindle_w / 2;
+    let left_x = inner_x + quarter.saturating_sub(half_sw);
+    let right_x = inner_x + three_q.saturating_sub(half_sw);
+
+    // Tape spanning between the two reels (inside the window).
+    let tape_y = spindle_y + spindle_h / 2;
+    let tape_start = left_x + spindle_w;
+    let tape_end = right_x;
+    if tape_end > tape_start && tape_y < inner_y + inner_h {
+        let tape_rect = Rect::new(tape_start, tape_y, tape_end - tape_start, 1);
+        let phase_d = phase as f64;
+        let canvas = Canvas::default()
+            .marker(Marker::Braille)
+            .background_color(case_color)
+            .x_bounds([0.0, 1.0])
+            .y_bounds([-1.0, 1.0])
+            .paint(move |ctx| {
+                ctx.draw(&CanvasLine {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 1.0,
+                    y2: 0.0,
+                    color: Color::Rgb(120, 90, 60),
+                });
+                let n = 32;
+                let drift = (phase_d * 0.06).rem_euclid(1.0 / n as f64);
+                for k in 0..n {
+                    let t = k as f64 / n as f64 + drift;
+                    ctx.draw(&CanvasLine {
+                        x1: t,
+                        y1: -0.4,
+                        x2: t + 0.005,
+                        y2: 0.4,
+                        color: Color::Rgb(200, 160, 110),
+                    });
+                }
+            });
+        frame.render_widget(canvas, tape_rect);
+    }
+
+    for &spindle_x in &[left_x, right_x] {
+        let rect = Rect::new(spindle_x, spindle_y, spindle_w, spindle_h);
+        let phase_d = phase as f64;
+        let h_bound = 1.15f64;
+        let w_bound = h_bound * (spindle_w as f64 / spindle_h as f64) / 2.0;
+        let canvas = Canvas::default()
+            .marker(Marker::Braille)
+            .background_color(case_color)
+            .x_bounds([-w_bound, w_bound])
+            .y_bounds([-h_bound, h_bound])
+            .paint(move |ctx| {
+                let seg = 80;
+                let circle = |ctx: &mut ratatui::widgets::canvas::Context,
+                              r: f64,
+                              color: Color| {
+                    for k in 0..seg {
+                        let a1 = (k as f64 / seg as f64) * std::f64::consts::TAU;
+                        let a2 = ((k + 1) as f64 / seg as f64) * std::f64::consts::TAU;
+                        ctx.draw(&CanvasLine {
+                            x1: a1.cos() * r,
+                            y1: a1.sin() * r,
+                            x2: a2.cos() * r,
+                            y2: a2.sin() * r,
+                            color,
+                        });
+                    }
+                };
+                // Translucent reel disc.
+                circle(ctx, 0.98, reel_outer);
+                circle(ctx, 0.90, Color::Rgb(190, 190, 200));
+                // Wound tape underneath the disc.
+                circle(ctx, 0.82, reel_inner);
+                circle(ctx, 0.72, Color::Rgb(80, 60, 50));
+
+                // Hub: VHS reels have a six-tooth gear in the middle.
+                let hub_r = 0.34;
+                circle(ctx, hub_r, Color::Rgb(40, 40, 50));
+                let teeth = 6;
+                for t in 0..teeth {
+                    let a = phase_d + (t as f64 / teeth as f64) * std::f64::consts::TAU;
+                    let r_in = hub_r * 0.6;
+                    let r_out = hub_r * 1.05;
+                    ctx.draw(&CanvasLine {
+                        x1: a.cos() * r_in,
+                        y1: a.sin() * r_in,
+                        x2: a.cos() * r_out,
+                        y2: a.sin() * r_out,
+                        color: Color::Rgb(220, 220, 230),
+                    });
+                }
+                // Spoke lines across the reel disc — these are what your eye
+                // actually tracks for rotation cues.
+                let spokes = 5;
+                for s in 0..spokes {
+                    let a = phase_d * 0.9 + (s as f64 / spokes as f64) * std::f64::consts::TAU;
+                    ctx.draw(&CanvasLine {
+                        x1: -a.cos() * 0.20,
+                        y1: -a.sin() * 0.20,
+                        x2: a.cos() * 0.86,
+                        y2: a.sin() * 0.86,
+                        color: Color::Rgb(160, 160, 175),
+                    });
+                }
+                // Center peg.
+                circle(ctx, 0.10, Color::Rgb(25, 25, 35));
+            });
+        frame.render_widget(canvas, rect);
+    }
 }
 
 /// Detailed ASCII cassette tape with two rotating spindles. The case, label
