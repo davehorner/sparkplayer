@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(4)])
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
         .split(area);
 
     if app.fullscreen_vis {
@@ -1940,30 +1940,13 @@ fn write_label_centered(
     write_label(buf, x + pad as u16, y, max_w - pad, text, fg, bg, bold);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_footer(frame: &mut Frame, area: Rect, _app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(NEON_PURPLE))
         .style(Style::default().bg(BG_PANEL));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(inner);
-
-    // Status line (top).
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                " ◆ ",
-                Style::default().fg(NEON_YELLOW),
-            ),
-            Span::styled(app.status.clone(), Style::default().fg(NEON_GREEN)),
-        ])),
-        rows[0],
-    );
 
     let key = |k: &str| {
         Span::styled(
@@ -2006,7 +1989,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
         key("q"),
         lbl("Quit"),
     ]);
-    frame.render_widget(Paragraph::new(controls), rows[1]);
+    frame.render_widget(Paragraph::new(controls), inner);
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
