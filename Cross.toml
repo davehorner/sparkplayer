@@ -34,12 +34,12 @@ pre-build = [
     "apt-get update",
     "apt-get install --assume-yes libc6-dev:$CROSS_DEB_ARCH linux-libc-dev:$CROSS_DEB_ARCH libasound2-dev:$CROSS_DEB_ARCH libavcodec-dev:$CROSS_DEB_ARCH libavformat-dev:$CROSS_DEB_ARCH libavutil-dev:$CROSS_DEB_ARCH libswresample-dev:$CROSS_DEB_ARCH libswscale-dev:$CROSS_DEB_ARCH pkg-config clang libclang-dev",
     # ffmpeg-sys-next builds a small `check.c` for the HOST arch (x86_64) but
-    # pkg-config feeds it -I/usr/include/arm-linux-gnueabihf as part of the
-    # FFmpeg Cflags. That pulls the armhf gnu/stubs.h into a host compile,
-    # which then wants gnu/stubs-soft.h (armhf packages only ship stubs-hard.h,
-    # since armhf is hard-float by definition). Both files are near-empty
-    # marker headers, so aliasing one onto the other is enough to unblock the
-    # host compile; the real cross compile uses the armhf gcc which selects
-    # stubs-hard.h via __ARM_PCS_VFP.
-    "[ -e /usr/include/arm-linux-gnueabihf/gnu/stubs-soft.h ] || ln -s stubs-hard.h /usr/include/arm-linux-gnueabihf/gnu/stubs-soft.h"
+    # pkg-config feeds it -I/usr/include/arm-linux-gnueabihf from the FFmpeg
+    # Cflags. That pulls the armhf gnu/stubs.h into a host compile, which then
+    # wants gnu/stubs-soft.h (armhf packages only ship stubs-hard.h, since
+    # armhf is hard-float by definition). stubs-*.h files are near-empty
+    # marker headers, so dropping an empty placeholder is enough to unblock
+    # the host compile; the real cross compile uses the armhf gcc which picks
+    # stubs-hard.h via __ARM_PCS_VFP and ignores the empty file.
+    "mkdir -p /usr/include/arm-linux-gnueabihf/gnu && touch /usr/include/arm-linux-gnueabihf/gnu/stubs-soft.h"
 ]
