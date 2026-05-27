@@ -1,14 +1,10 @@
-mod app;
 mod audio;
-mod config;
+mod backends;
 mod external_window;
-mod library;
-mod metadata;
-mod subtitles;
-mod theme;
-mod ui;
+mod library_native;
+mod metadata_native;
+mod subtitles_native;
 mod video;
-mod visualizer;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -24,13 +20,20 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::app::{App, AV_OFFSET_STEP_SECS, GraphicsChoice};
+use sparkplayer_core::backend::{ConfigStore, CoreKey, CoreKeyEvent};
+use sparkplayer_core::{App, ui};
+
+use crate::audio::AudioPlayer;
+use crate::backends::{
+    build_picker, GraphicsChoice, NativeAlbumArt, NativeConfigStore, NativeVideoBackend,
+};
+use crate::library_native::NativeLibrary;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum GraphicsArg {
     /// Auto-detect via terminal queries (Kitty / iTerm / Sixel / Halfblocks)
     Auto,
-    /// Force colored halfblocks — works on every truecolor terminal (incl. Alacritty)
+    /// Force colored halfblocks — works on every truecolor terminal
     Halfblocks,
     /// Force the Sixel protocol (xterm, foot, wezterm, mlterm)
     Sixel,
@@ -66,8 +69,7 @@ struct Cli {
     #[arg(long, default_value_t = true)]
     autoplay: bool,
 
-    /// Override the album-art graphics protocol. Alacritty has no graphics
-    /// protocol support, so it always falls back to halfblocks.
+    /// Override the album-art graphics protocol.
     #[arg(long, value_enum, default_value_t = GraphicsArg::Auto)]
     graphics: GraphicsArg,
 
@@ -76,36 +78,77 @@ struct Cli {
     video_window: bool,
 
     /// Preferred subtitle language (ISO code like `eng`/`en` or a label like
-    /// `English`). The first matching track is activated as soon as subtitles
-    /// finish loading.
+    /// `English`).
     #[arg(long, value_name = "LANG")]
     subtitle_lang: Option<String>,
+}
+
+/// Translate a crossterm key into the platform-neutral [`CoreKeyEvent`] the
+/// core dispatcher understands. Public so the external-window backend can map
+/// keys it forwards from SDL through the same path.
+pub fn map_key(code: KeyCode, mods: KeyModifiers) -> CoreKeyEvent {
+    let core = match code {
+        KeyCode::Char(c) => CoreKey::Char(c),
+        KeyCode::Up => CoreKey::Up,
+        KeyCode::Down => CoreKey::Down,
+        KeyCode::Left => CoreKey::Left,
+        KeyCode::Right => CoreKey::Right,
+        KeyCode::PageUp => CoreKey::PageUp,
+        KeyCode::PageDown => CoreKey::PageDown,
+        KeyCode::Home => CoreKey::Home,
+        KeyCode::End => CoreKey::End,
+        KeyCode::Tab => CoreKey::Tab,
+        KeyCode::Enter => CoreKey::Enter,
+        KeyCode::Esc => CoreKey::Esc,
+        _ => CoreKey::Other,
+    };
+    CoreKeyEvent::with_ctrl(core, mods.contains(KeyModifiers::CONTROL))
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let target_path = cli.path.clone().unwrap_or_else(library::default_music_dir);
+    let target_path = cli
+        .path
+        .clone()
+        .unwrap_or_else(library_native::default_music_dir);
 
-    let tracks = library::load_tracks(&target_path).unwrap_or_default();
+    let tracks = library_native::load_tracks(&target_path).unwrap_or_default();
     let initial_dir = if target_path.is_dir() {
         target_path.clone()
     } else {
         target_path
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(library::default_music_dir)
+            .unwrap_or_else(library_native::default_music_dir)
     };
 
-    let cfg = config::load();
-    let mut app = App::new(tracks, initial_dir, cli.graphics.into(), &cfg)?;
-    app.preferred_subtitle_lang = cli.subtitle_lang.clone();
-    app.external_window_enabled = cli.video_window;
+    let config = NativeConfigStore;
+    let cfg = config.load();
 
     let mut terminal = setup_terminal().context("setting up terminal")?;
-    // Picker queries the terminal — must happen after raw mode is enabled
-    // so escape responses come through stdin without echoing as characters.
-    app.init_graphics();
+    // Picker queries the terminal — must happen after raw mode is enabled so
+    // escape responses come through stdin without echoing as characters.
+    let picker = build_picker(cli.graphics.into());
+
+    let audio = AudioPlayer::new()?;
+    let video = NativeVideoBackend::new(picker.clone());
+    let art = NativeAlbumArt::new(picker);
+
+    let mut app = App::new(
+        Box::new(audio),
+        Box::new(video),
+        Box::new(NativeLibrary),
+        Box::new(config),
+        Box::new(art),
+        tracks,
+        initial_dir,
+        &cfg,
+    );
+    app.preferred_subtitle_lang = cli.subtitle_lang.clone();
+    if cli.video_window {
+        app.video.set_external_window(true);
+    }
 
     if cli.autoplay && !app.tracks.is_empty() {
         let _ = app.play_index(0);
@@ -132,14 +175,13 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     Ok(())
 }
 
-fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     let frame_dur = Duration::from_millis(33);
+    let start = Instant::now();
     let mut last_tick = Instant::now();
 
     loop {
+        app.set_clock(start.elapsed().as_secs_f64());
         terminal.draw(|f| ui::draw(f, app))?;
 
         let timeout = frame_dur
@@ -148,15 +190,14 @@ fn run_loop(
         if event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Release {
-                    handle_key(app, key.code, key.modifiers)?;
+                    app.handle_key(map_key(key.code, key.modifiers))?;
                 }
             }
         }
 
-        // Forward keystrokes captured by the SDL playback window so the same
-        // shortcuts work regardless of which window has focus.
-        for (code, mods) in app.drain_external_keys() {
-            handle_key(app, code, mods)?;
+        // Forward keystrokes captured by the SDL playback window.
+        for ev in app.drain_external_keys() {
+            app.handle_key(ev)?;
         }
 
         if last_tick.elapsed() >= frame_dur {
@@ -168,77 +209,6 @@ fn run_loop(
         if app.should_quit {
             break;
         }
-    }
-    Ok(())
-}
-
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<()> {
-    if app.show_help {
-        match code {
-            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('h') | KeyCode::Char('q') => {
-                app.show_help = false;
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    if app.show_escape_menu {
-        // Ctrl+C still escapes to quit even while the menu is open.
-        if matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL) {
-            app.should_quit = true;
-            return Ok(());
-        }
-        match code {
-            KeyCode::Esc => app.close_escape_menu(),
-            KeyCode::Up => app.escape_menu_move(-1),
-            KeyCode::Down => app.escape_menu_move(1),
-            KeyCode::Left => app.escape_menu_adjust(-1)?,
-            KeyCode::Right => app.escape_menu_adjust(1)?,
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if app.escape_menu_activate()? {
-                    app.close_escape_menu();
-                }
-            }
-            _ => {}
-        }
-        return Ok(());
-    }
-
-    match code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Esc => app.open_escape_menu(),
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => app.should_quit = true,
-        KeyCode::Char(' ') => app.player.toggle_pause(),
-        KeyCode::Char('n') => app.next_track()?,
-        KeyCode::Char('p') => app.prev_track()?,
-        KeyCode::Char('v') => app.cycle_visualizer(),
-        KeyCode::Char('t') => app.cycle_theme(),
-        KeyCode::Char('f') => app.cycle_display_mode(),
-        KeyCode::Char('r') => app.cycle_repeat(),
-        KeyCode::Char('s') => app.toggle_shuffle(),
-        KeyCode::Char('a') => app.queue_selected_browser(),
-        KeyCode::Char('A') => app.queue_browser_directory(),
-        KeyCode::Char('C') => app.clear_playlist(),
-        KeyCode::Char('c') => app.cycle_subtitle_track(),
-        KeyCode::Char('?') | KeyCode::Char('h') => app.show_help = true,
-        KeyCode::Tab => app.focus_next(),
-        KeyCode::Up => app.move_selection(-1),
-        KeyCode::Down => app.move_selection(1),
-        KeyCode::PageUp => app.page(-1),
-        KeyCode::PageDown => app.page(1),
-        KeyCode::Home => app.select_first(),
-        KeyCode::End => app.select_last(),
-        KeyCode::Left if mods.contains(KeyModifiers::CONTROL) => app.seek_seconds(-30.0),
-        KeyCode::Right if mods.contains(KeyModifiers::CONTROL) => app.seek_seconds(30.0),
-        KeyCode::Left => app.seek_seconds(-10.0),
-        KeyCode::Right => app.seek_seconds(10.0),
-        KeyCode::Char('-') | KeyCode::Char('_') => app.volume_step(-0.05),
-        KeyCode::Char('+') | KeyCode::Char('=') => app.volume_step(0.05),
-        KeyCode::Char('[') => app.adjust_av_offset(-AV_OFFSET_STEP_SECS),
-        KeyCode::Char(']') => app.adjust_av_offset(AV_OFFSET_STEP_SECS),
-        KeyCode::Enter => app.activate_selection()?,
-        _ => {}
     }
     Ok(())
 }

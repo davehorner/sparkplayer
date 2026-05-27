@@ -1,0 +1,4 @@
+{
+  "_comment": "Web-playlist mode: list hosted media here and SparkPlayer plays them on load. Leave `tracks` empty to start in local-file mode (use the file picker). Hosted media must send permissive CORS headers, or the visualizer reads silence.",
+  "tracks": []
+}

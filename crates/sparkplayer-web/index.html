@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SparkPlayer</title>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="copy-file" href="manifest.json" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #141423;
+        overflow: hidden;
+      }
+      /* Ratzilla mounts its cell grid inside this element; overlays are sized
+         relative to it. */
+      #sparkplayer-root {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+      }
+      #toolbar {
+        position: fixed;
+        top: 4px;
+        right: 8px;
+        z-index: 20;
+        font-family: monospace;
+        color: #e0e0f0;
+      }
+      #file-input {
+        color: #e0e0f0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="toolbar">
+      <label for="file-input">Open local files:</label>
+      <input id="file-input" type="file" accept="audio/*,video/*" multiple />
+    </div>
+    <div id="sparkplayer-root"></div>
+  </body>
+</html>
