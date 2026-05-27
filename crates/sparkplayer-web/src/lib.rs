@@ -94,7 +94,7 @@ pub fn start() -> Result<(), JsValue> {
     let config = LocalStorageConfig;
     let cfg = sparkplayer_core::backend::ConfigStore::load(&config);
 
-    let app = App::new(
+    let mut app = App::new(
         Box::new(audio),
         Box::new(video),
         Box::new(WebLibrary::new(meta_map.clone())),
@@ -104,6 +104,8 @@ pub fn start() -> Result<(), JsValue> {
         PathBuf::new(),
         &cfg,
     );
+    // The browser can open external links, so expose the escape-menu GitHub entry.
+    app.url_open_supported = true;
     let app: SharedApp = Rc::new(std::cell::RefCell::new(app));
     app.borrow_mut().status =
         String::from("Press any key (or pick files) to start — browser audio needs a gesture");
@@ -174,6 +176,11 @@ pub fn start() -> Result<(), JsValue> {
                     sparkplayer_core::ui::draw(frame, &mut a);
                 });
                 position_overlays(&document, &a, &video_el, &img_el, area);
+
+                // Open a URL queued by the escape menu (the GitHub entry).
+                if let Some(url) = a.take_pending_url_open() {
+                    let _ = window.open_with_url_and_target(&url, "_blank");
+                }
 
                 // On track change, load this track's manifest extras.
                 let cur = a.playing_track.as_ref().map(|t| t.locator());

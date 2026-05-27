@@ -27,6 +27,9 @@ const MIN_AV_OFFSET_SECS: f64 = 0.050;
 const AV_OFFSET_SLEW_PER_TICK: f64 = 0.005;
 pub const AV_OFFSET_STEP_SECS: f64 = 0.025;
 
+/// The project's GitHub page, opened from the escape menu's "GitHub" entry.
+pub const GITHUB_URL: &str = "https://github.com/dividebysandwich/sparkplayer";
+
 fn baseline_av_offset(audio_lat_secs: f64) -> f64 {
     (audio_lat_secs * AV_OFFSET_BACKEND_MULT).max(BASELINE_AV_OFFSET_SECS)
 }
@@ -48,6 +51,7 @@ pub enum EscapeMenuKind {
     VideoWindow,
     Repeat,
     Shuffle,
+    Github,
     Separator,
     Quit,
 }
@@ -137,6 +141,13 @@ pub struct App {
     pub escape_menu_selected: usize,
     pub fullscreen_vis: bool,
 
+    /// Whether the platform can open external URLs (web: yes via the browser;
+    /// native: no). Gates the escape menu's "GitHub" entry.
+    pub url_open_supported: bool,
+    /// A URL the platform should open, set when the user activates the GitHub
+    /// entry and drained by the run loop.
+    pending_url_open: Option<String>,
+
     pub theme: Theme,
 
     /// Monotonic wall-clock seconds, supplied by the platform each frame. Used
@@ -216,6 +227,8 @@ impl App {
             show_escape_menu: false,
             escape_menu_selected: 0,
             fullscreen_vis: false,
+            url_open_supported: false,
+            pending_url_open: None,
             theme,
             clock_secs: 0.0,
             last_video_rect: None,
@@ -849,7 +862,7 @@ impl App {
         } else {
             format!("{:+.0} ms", self.av_offset_secs * 1000.0)
         };
-        vec![
+        let mut items = vec![
             EscapeMenuItem {
                 kind: EscapeMenuKind::Volume,
                 enabled: true,
@@ -909,19 +922,28 @@ impl App {
                 label: "Shuffle",
                 value: if self.shuffle { "On" } else { "Off" }.to_string(),
             },
-            EscapeMenuItem {
-                kind: EscapeMenuKind::Separator,
-                enabled: false,
-                label: "",
-                value: String::new(),
-            },
-            EscapeMenuItem {
-                kind: EscapeMenuKind::Quit,
+        ];
+        if self.url_open_supported {
+            items.push(EscapeMenuItem {
+                kind: EscapeMenuKind::Github,
                 enabled: true,
-                label: "Quit",
-                value: String::new(),
-            },
-        ]
+                label: "GitHub",
+                value: "Open ↗".to_string(),
+            });
+        }
+        items.push(EscapeMenuItem {
+            kind: EscapeMenuKind::Separator,
+            enabled: false,
+            label: "",
+            value: String::new(),
+        });
+        items.push(EscapeMenuItem {
+            kind: EscapeMenuKind::Quit,
+            enabled: true,
+            label: "Quit",
+            value: String::new(),
+        });
+        items
     }
 
     fn selectable_indices(&self) -> Vec<usize> {
@@ -989,7 +1011,7 @@ impl App {
             EscapeMenuKind::VideoWindow => self.toggle_video_window(),
             EscapeMenuKind::Repeat => self.cycle_repeat(),
             EscapeMenuKind::Shuffle => self.toggle_shuffle(),
-            EscapeMenuKind::Quit | EscapeMenuKind::Separator => {}
+            EscapeMenuKind::Github | EscapeMenuKind::Quit | EscapeMenuKind::Separator => {}
         }
         Ok(())
     }
@@ -1007,6 +1029,10 @@ impl App {
         match item.kind {
             EscapeMenuKind::Quit => {
                 self.should_quit = true;
+                return Ok(true);
+            }
+            EscapeMenuKind::Github => {
+                self.pending_url_open = Some(GITHUB_URL.to_string());
                 return Ok(true);
             }
             EscapeMenuKind::Fullscreen => self.toggle_fullscreen(),
@@ -1031,6 +1057,11 @@ impl App {
 
     pub fn position(&self) -> Duration {
         self.audio.position()
+    }
+
+    /// Take any URL queued for the platform to open (e.g. the GitHub entry).
+    pub fn take_pending_url_open(&mut self) -> Option<String> {
+        self.pending_url_open.take()
     }
 
     /// Dispatch a platform-neutral key event. Shared by both builds so the
