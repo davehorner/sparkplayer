@@ -77,9 +77,10 @@ fn draw_spectrum(frame: &mut Frame, area: Rect, app: &mut App, active: bool) {
             let color = bar_color(row, h);
             if row < full_cells {
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_char('█');
-                    cell.set_fg(color);
-                    cell.set_bg(panel_bg());
+                    // Solid part of the bar: fill via background so the web
+                    // canvas has no inter-row gap.
+                    cell.set_char(' ');
+                    cell.set_bg(color);
                 }
             } else if row == full_cells && frac_eighths > 0 {
                 let ch = match frac_eighths {
@@ -143,15 +144,27 @@ fn draw_amplitude_strip(frame: &mut Frame, area: Rect, points: &[f32], w: usize,
             let color = lerp(cyan(), pink(), d as f32 / mid.max(1) as f32);
             let yu = mid.saturating_sub(d);
             let yd = (mid + d).min(h - 1);
+            // Inner cells fill via background (no web-canvas row gap); the tip
+            // cell keeps a half-block glyph for the amplitude edge.
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y + yu as u16)) {
-                cell.set_char(if d == amp { '▀' } else { '█' });
-                cell.set_fg(color);
-                cell.set_bg(panel_bg());
+                if d == amp {
+                    cell.set_char('▀');
+                    cell.set_fg(color);
+                    cell.set_bg(panel_bg());
+                } else {
+                    cell.set_char(' ');
+                    cell.set_bg(color);
+                }
             }
             if let Some(cell) = buf.cell_mut((area.x + i as u16, area.y + yd as u16)) {
-                cell.set_char(if d == amp { '▄' } else { '█' });
-                cell.set_fg(color);
-                cell.set_bg(panel_bg());
+                if d == amp {
+                    cell.set_char('▄');
+                    cell.set_fg(color);
+                    cell.set_bg(panel_bg());
+                } else {
+                    cell.set_char(' ');
+                    cell.set_bg(color);
+                }
             }
         }
     }
@@ -226,9 +239,10 @@ fn draw_spectrogram(frame: &mut Frame, area: Rect, app: &mut App, active: bool) 
             let y = area.y + area.height - 1 - yi as u16;
             let color = heatmap(*mag);
             if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_char('█');
-                cell.set_fg(color);
-                cell.set_bg(panel_bg());
+                // Paint the cell via its background so it fills the full cell on
+                // the web canvas backend (a `█` glyph leaves a row gap there).
+                cell.set_char(' ');
+                cell.set_bg(color);
             }
         }
     }
