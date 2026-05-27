@@ -7,7 +7,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Padding, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap};
 use ratatui_image::StatefulImage;
 
 use crate::app::{App, FocusPane};
@@ -279,26 +279,12 @@ pub(super) fn draw_now_playing(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         0.0
     };
-    let label = format!(
-        " {} / {} ",
-        fmt_time(pos),
-        if dur.is_zero() {
-            String::from("--:--")
-        } else {
-            fmt_time(dur)
-        }
-    );
-
-    let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(pink()).bg(Color::Rgb(50, 30, 70)))
-        .ratio(ratio)
-        .label(Span::styled(
-            label,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ));
-    frame.render_widget(gauge, inner_layout[2]);
+    let total = if dur.is_zero() {
+        String::from("--:--")
+    } else {
+        fmt_time(dur)
+    };
+    draw_progress_bar(frame, inner_layout[2], ratio, &fmt_time(pos), &total);
 
     let mode_label = if app.player.is_paused() {
         " ⏸ Paused "
@@ -600,6 +586,110 @@ pub(super) fn draw_footer(frame: &mut Frame, area: Rect, _app: &App) {
         used += cost;
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), inner);
+}
+
+/// Wall-clock seconds since first call, used purely to drive UI animation.
+/// Independent of playback so the bar shimmers smoothly at the render rate.
+fn anim_time() -> f32 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+/// Custom playback bar: a solid groove with a bright fill whose hue gently
+/// flows between the theme's primary and accent (a "color wave"), plus a
+/// comet-tail glow trailing the playhead. Sub-cell precision at the fill edge
+/// via left-eighth blocks. The bottom row carries elapsed / percent / total.
+fn draw_progress_bar(frame: &mut Frame, area: Rect, ratio: f64, pos: &str, total: &str) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = area.width as usize;
+    // Reserve the last row for the time read-out when we have the height for it.
+    let bar_rows = if area.height >= 2 { area.height - 1 } else { area.height };
+
+    let t = anim_time();
+    let track = Color::Rgb(38, 26, 56); // dim groove the fill rides in
+
+    // Sub-cell fill: `full` columns are solid, the next column is a partial
+    // left-block sized to `frac`.
+    let filled_f = (ratio.clamp(0.0, 1.0) as f32) * w as f32;
+    let full = filled_f.floor() as usize;
+    let frac = filled_f - full as f32;
+    const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+
+    let buf = frame.buffer_mut();
+    for x in 0..w {
+        // Color wave: mostly the primary hue, with a band of accent flowing
+        // left-to-right over time. Kept narrow (45%) so it stays subtle.
+        let wave = 0.5 + 0.5 * ((x as f32) * 0.22 - t * 2.4).sin();
+        let base = lerp(pink(), cyan(), wave * 0.45);
+        // Comet glow: cells just behind the playhead brighten toward highlight.
+        let behind = filled_f - (x as f32 + 0.5);
+        let glow = if behind >= 0.0 {
+            (1.0 - behind / 4.0).clamp(0.0, 1.0) * 0.7
+        } else {
+            0.0
+        };
+        let fill = lerp(base, yellow(), glow);
+
+        let (ch, fg, bg) = if x < full {
+            ('█', fill, panel_bg())
+        } else if x == full && frac > 0.0 {
+            let idx = (frac * 8.0).round().clamp(1.0, 7.0) as usize;
+            (EIGHTHS[idx], fill, track)
+        } else {
+            ('█', track, panel_bg())
+        };
+
+        for row in 0..bar_rows {
+            if let Some(cell) = buf.cell_mut((area.x + x as u16, area.y + row)) {
+                cell.set_char(ch);
+                cell.set_fg(fg);
+                cell.set_bg(bg);
+            }
+        }
+    }
+
+    if area.height < 2 {
+        return;
+    }
+    // Time read-out beneath the bar: elapsed left, percent centered, total right.
+    let pct = format!("{}%", (ratio.clamp(0.0, 1.0) * 100.0).round() as u32);
+    let line = Line::from(vec![
+        Span::styled(pos.to_string(), Style::default().fg(text())),
+        Span::styled(pct, Style::default().fg(dim())),
+        Span::styled(total.to_string(), Style::default().fg(text())),
+    ]);
+    let time_area = Rect::new(area.x, area.y + bar_rows, area.width, 1);
+    render_three_up(frame, time_area, &line);
+}
+
+/// Lay out exactly three spans across `area`: first flush left, second
+/// centered, third flush right. Falls back to plain left alignment if the
+/// area is too narrow to separate them.
+fn render_three_up(frame: &mut Frame, area: Rect, line: &Line) {
+    let spans = &line.spans;
+    let w = area.width as usize;
+    let len: Vec<usize> = spans.iter().map(|s| s.content.chars().count()).collect();
+    let total_len: usize = len.iter().sum();
+    if spans.len() != 3 || total_len >= w {
+        frame.render_widget(Paragraph::new(line.clone()), area);
+        return;
+    }
+    let mut out: Vec<Span> = Vec::with_capacity(5);
+    out.push(spans[0].clone());
+    // Spaces before the centered span so its midpoint lands at the bar center.
+    let center_start = (w.saturating_sub(len[1])) / 2;
+    let left_pad = center_start.saturating_sub(len[0]);
+    out.push(Span::raw(" ".repeat(left_pad)));
+    out.push(spans[1].clone());
+    let used = len[0] + left_pad + len[1];
+    let right_pad = w.saturating_sub(used + len[2]);
+    out.push(Span::raw(" ".repeat(right_pad)));
+    out.push(spans[2].clone());
+    frame.render_widget(Paragraph::new(Line::from(out)), area);
 }
 
 fn fmt_time(d: Duration) -> String {
