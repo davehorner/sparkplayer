@@ -374,10 +374,21 @@ impl AudioPlayer {
             self.player.append(tapped);
         } else {
             let file = File::open(path)?;
-            let source = Decoder::new(BufReader::new(file))?;
-            let skipped = source.skip_duration(target);
-            let tapped = TapSource::new(skipped, self.tap.clone());
-            self.player.append(tapped);
+            let mut source = Decoder::new(BufReader::new(file))?;
+            // Prefer a container-level seek (symphonia): cost is independent of
+            // the target position. Falling back to `skip_duration` decodes and
+            // discards every sample from the start of the file, so the delay
+            // grows the further into the track we seek.
+            if source.try_seek(target).is_ok() {
+                let tapped = TapSource::new(source, self.tap.clone());
+                self.player.append(tapped);
+            } else {
+                let file = File::open(path)?;
+                let source = Decoder::new(BufReader::new(file))?;
+                let skipped = source.skip_duration(target);
+                let tapped = TapSource::new(skipped, self.tap.clone());
+                self.player.append(tapped);
+            }
         }
 
         if was_paused {
