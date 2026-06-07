@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="windows-1252"?>
+
+<!--
+  WiX source for the SparkPlayer Windows MSI installer.
+
+  This file is committed (not regenerated with `cargo wix init`) because the
+  default cargo-wix template only packages the executable. SparkPlayer also
+  needs the FFmpeg and SDL2 runtime DLLs alongside sparkplayer.exe: they are
+  eagerly-loaded imports, so a missing one makes the process fail to start
+  before main() runs (the symptom: the program "quits without an error
+  message"). The .zip already bundles these DLLs; this makes the MSI do the
+  same.
+
+  The soname-versioned FFmpeg DLL names below (avcodec-62, avutil-60, ...)
+  match the FFmpeg build pinned in .github/workflows/release.yml
+  (gyan.dev ffmpeg-8.1.1 full_build-shared, LGPL). If that pin is bumped to a
+  new FFmpeg major version, update these names to match the new sonames or the
+  WiX build will fail on the missing source files.
+
+  Only the libraries SparkPlayer actually links are bundled (codec, format,
+  util, software-resampling, software-scaling + SDL2); avfilter/avdevice are
+  intentionally excluded since the app never loads them.
+-->
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Product
+        Id="*"
+        Name="SparkPlayer"
+        UpgradeCode="8E83D6C4-5D8F-4F2E-9A19-1A8E5C2B3E4F"
+        Manufacturer="dividebysandwich"
+        Language="1033"
+        Codepage="1252"
+        Version="$(var.Version)">
+
+        <Package
+            Id="*"
+            Keywords="Installer"
+            Description="SparkPlayer - a vibrant terminal media player"
+            Manufacturer="dividebysandwich"
+            InstallerVersion="450"
+            Languages="1033"
+            Compressed="yes"
+            InstallScope="perMachine"
+            SummaryCodepage="1252" />
+
+        <MajorUpgrade
+            Schedule="afterInstallInitialize"
+            DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
+
+        <Media Id="1" Cabinet="media1.cab" EmbedCab="yes" DiskPrompt="CD-ROM #1" />
+        <Property Id="DiskPrompt" Value="SparkPlayer Installation" />
+
+        <Directory Id="TARGETDIR" Name="SourceDir">
+            <Directory Id="ProgramFiles64Folder" Name="PFiles">
+                <Directory Id="APPLICATIONFOLDER" Name="SparkPlayer">
+
+                    <Component Id="binary0" Guid="*">
+                        <File
+                            Id="exe0"
+                            Name="sparkplayer.exe"
+                            DiskId="1"
+                            Source="$(var.CargoTargetBinDir)\sparkplayer.exe"
+                            KeyPath="yes" />
+                    </Component>
+
+                    <!-- FFmpeg 8.1.1 (gyan.dev full-shared, LGPL) runtime libraries. -->
+                    <Component Id="dll_avcodec" Guid="*">
+                        <File Id="avcodec" Name="avcodec-62.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\avcodec-62.dll" KeyPath="yes" />
+                    </Component>
+                    <Component Id="dll_avformat" Guid="*">
+                        <File Id="avformat" Name="avformat-62.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\avformat-62.dll" KeyPath="yes" />
+                    </Component>
+                    <Component Id="dll_avutil" Guid="*">
+                        <File Id="avutil" Name="avutil-60.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\avutil-60.dll" KeyPath="yes" />
+                    </Component>
+                    <Component Id="dll_swresample" Guid="*">
+                        <File Id="swresample" Name="swresample-6.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\swresample-6.dll" KeyPath="yes" />
+                    </Component>
+                    <Component Id="dll_swscale" Guid="*">
+                        <File Id="swscale" Name="swscale-9.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\swscale-9.dll" KeyPath="yes" />
+                    </Component>
+
+                    <!-- SDL2 2.32.4 (zlib) runtime, used by the video window. -->
+                    <Component Id="dll_sdl2" Guid="*">
+                        <File Id="sdl2" Name="SDL2.dll" DiskId="1"
+                              Source="$(var.CargoTargetBinDir)\SDL2.dll" KeyPath="yes" />
+                    </Component>
+
+                    <!-- License shipped next to the binary (GPL-2.0-only). -->
+                    <Component Id="license_doc" Guid="*">
+                        <File Id="license_txt" Name="LICENSE.txt" DiskId="1"
+                              Source="$(sys.SOURCEFILEDIR)..\LICENSE" KeyPath="yes" />
+                    </Component>
+
+                    <!-- Add the install dir to the system PATH so `sparkplayer`
+                         can be launched from any terminal. GUID taken from
+                         Cargo.toml [package.metadata.wix] path-guid. -->
+                    <Component Id="Path" Guid="4B6A1C2E-9D7F-4E3A-8C5B-6F2D9E1A4B7C" KeyPath="yes">
+                        <Environment
+                            Id="PATH"
+                            Name="PATH"
+                            Value="[APPLICATIONFOLDER]"
+                            Permanent="no"
+                            Part="last"
+                            Action="set"
+                            System="yes" />
+                    </Component>
+                </Directory>
+            </Directory>
+        </Directory>
+
+        <Feature
+            Id="Binaries"
+            Title="Application"
+            Description="Installs SparkPlayer and its bundled FFmpeg/SDL2 runtime libraries."
+            Level="1"
+            ConfigurableDirectory="APPLICATIONFOLDER"
+            AllowAdvertise="no"
+            Display="expand"
+            Absent="disallow">
+
+            <ComponentRef Id="binary0" />
+            <ComponentRef Id="dll_avcodec" />
+            <ComponentRef Id="dll_avformat" />
+            <ComponentRef Id="dll_avutil" />
+            <ComponentRef Id="dll_swresample" />
+            <ComponentRef Id="dll_swscale" />
+            <ComponentRef Id="dll_sdl2" />
+            <ComponentRef Id="license_doc" />
+
+            <Feature
+                Id="Environment"
+                Title="PATH Environment Variable"
+                Description="Add the install location to the PATH so SparkPlayer can be run from any terminal."
+                Level="1"
+                Absent="allow">
+                <ComponentRef Id="Path" />
+            </Feature>
+        </Feature>
+
+        <SetProperty Id="ARPINSTALLLOCATION" Value="[APPLICATIONFOLDER]" After="CostFinalize" />
+        <Property Id="ARPHELPLINK" Value="https://github.com/dividebysandwich/sparkplayer" />
+
+        <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+        <WixVariable Id="WixUILicenseRtf" Value="$(sys.SOURCEFILEDIR)License.rtf" />
+        <UIRef Id="WixUI_InstallDir" />
+        <UIRef Id="WixUI_ErrorProgressText" />
+    </Product>
+</Wix>

@@ -167,7 +167,11 @@ jobs:
         run: |
           # Prebuilt FFmpeg shared dev build from gyan.dev (LGPL).
           # ffmpeg-sys-next looks for $FFMPEG_DIR/include and $FFMPEG_DIR/lib.
-          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z'
+          # Pinned to a specific version so the soname-versioned DLL names
+          # (avcodec-62.dll, avutil-60.dll, ...) are deterministic and match
+          # the names hard-coded in wix/main.wxs. Bumping this requires
+          # updating those names in the WiX source too.
+          $url = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-full_build-shared.7z'
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z -UseBasicParsing
           7z x ffmpeg.7z -offmpeg-dist -y | Out-Null
           $root = (Get-ChildItem ffmpeg-dist -Directory | Select-Object -First 1).FullName
@@ -210,12 +214,12 @@ jobs:
       - name: Install cargo-wix
         run: cargo install cargo-wix --locked
 
-      - name: Initialize WiX template
-        # The generated wix/main.wxs is not committed; regenerate per build.
-        run: cargo wix init -p sparkplayer-native --force
-
       - name: Build MSI installer
-        run: cargo wix -p sparkplayer-native --no-build --nocapture --target ${{ env.TARGET }} --output target/wix
+        # Use the committed wix/main.wxs (which bundles the FFmpeg + SDL2 DLLs)
+        # instead of regenerating the exe-only default template. The DLLs were
+        # copied next to the binary in the staging step above, so the
+        # $(var.CargoTargetBinDir) sources in the WiX file resolve.
+        run: cargo wix -p sparkplayer-native --no-build --nocapture --target ${{ env.TARGET }} --output target/wix wix/main.wxs
 
       - name: Stage zip archive
         shell: pwsh
