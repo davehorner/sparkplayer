@@ -7,7 +7,8 @@ use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::backend::{
-    AlbumArtRenderer, AudioBackend, ConfigStore, CoreKey, CoreKeyEvent, MediaLibrary, VideoBackend,
+    AlbumArtRenderer, AudioBackend, ConfigStore, CoreKey, CoreKeyEvent, CoreMouseEvent,
+    CoreMouseKind, MediaLibrary, VideoBackend,
 };
 use crate::config::Config;
 use crate::library::{self, Track, TrackRef};
@@ -27,6 +28,13 @@ const MIN_AV_OFFSET_SECS: f64 = 0.050;
 /// Max change per tick when auto-tracking.
 const AV_OFFSET_SLEW_PER_TICK: f64 = 0.005;
 pub const AV_OFFSET_STEP_SECS: f64 = 0.025;
+
+/// How long before the end of a track its successor is handed to the audio
+/// backend. Long enough that opening the file and filling the decoder's first
+/// buffers is comfortably done before the seam — short enough that a skip or a
+/// playlist edit in the meantime is the common case, not the rare one, and the
+/// queue is simply rebuilt.
+const PRELOAD_LEAD_SECS: f64 = 15.0;
 
 /// Disagreement (seconds) between the smoothed video clock and the raw audio
 /// position that forces a hard resync. Must sit *above* one audio-buffer
@@ -57,6 +65,22 @@ pub enum FocusPane {
     Browser,
 }
 
+/// A clickable playback control in the "Now Playing" badge row. The UI records
+/// each badge's on-screen rect during draw (into `App::control_hits`) so
+/// `handle_mouse` can map a click back to the action.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum MouseControl {
+    /// Transport buttons (cassette-deck style).
+    SeekBack,
+    Stop,
+    PlayPause,
+    SeekForward,
+    CycleRepeat,
+    ToggleShuffle,
+    ToggleFavorite,
+    CycleSubtitle,
+}
+
 /// Whether the app is capturing typed text, and for what. In `Filter` mode
 /// keystrokes edit the live `filter_query`; in `SavePlaylist` mode they edit the
 /// `input_buffer` (the filename to write).
@@ -74,11 +98,14 @@ pub enum EscapeMenuKind {
     Subtitle,
     AvOffset,
     Visualizer,
+    FftSize,
+    ScrollSpeed,
     Theme,
     Fullscreen,
     VideoWindow,
     Repeat,
     Shuffle,
+    Gapless,
     Help,
     Github,
     Separator,
@@ -90,6 +117,16 @@ pub struct EscapeMenuItem {
     pub enabled: bool,
     pub label: &'static str,
     pub value: String,
+}
+
+/// Identifies the playlist entry queued for gapless playback. The locator rides
+/// along with the index because a shuffle or an edit can leave the index valid
+/// while pointing at a completely different track — comparing both is what
+/// makes the queue self-correcting.
+#[derive(Clone, PartialEq, Eq)]
+struct PreloadSlot {
+    index: usize,
+    locator: String,
 }
 
 /// Which slice of the library the global search overlay browses. `Tab` cycles
@@ -220,6 +257,16 @@ pub struct App {
 
     pub repeat: RepeatMode,
     pub shuffle: bool,
+    /// Whether the next track is handed to the audio backend early so playback
+    /// crosses the seam without a gap. See `maintain_preload`.
+    pub gapless: bool,
+
+    /// The playlist entry currently queued inside the audio backend, if any.
+    preloaded: Option<PreloadSlot>,
+    /// The entry we last offered to the backend, whether or not it took it.
+    /// Keeps a track that won't preload (a video, an unreadable file) from
+    /// being reopened on every tick.
+    preload_tried: Option<PreloadSlot>,
 
     /// Favorited track locators (paths). Toggled with `F`, persisted.
     pub favorites: HashSet<String>,
@@ -289,6 +336,12 @@ pub struct App {
 
     pub theme: Theme,
 
+    /// Whether the display can render distinct 24-bit fg/bg colors per cell.
+    /// Lets the spectrogram use half-block cells (two colors → double vertical
+    /// resolution); when false it falls back to solid full-cell blocks. Native
+    /// sets it from `COLORTERM`; defaults on (the palette is 24-bit throughout).
+    pub truecolor: bool,
+
     /// Monotonic wall-clock seconds, supplied by the platform each frame. Used
     /// for UI animation and timed announcements. `std::time::Instant` is
     /// unavailable on wasm, so time always flows in through here instead.
@@ -300,6 +353,18 @@ pub struct App {
     pub last_video_rect: Option<Rect>,
     pub last_art_rect: Option<Rect>,
     pub last_browser_rect: Option<Rect>,
+
+    /// Mouse hit-test rects, recorded each `ui::draw` and consumed by
+    /// `handle_mouse`. The inner (bordered) content rects of the two lists, the
+    /// progress/seek bar, the visualizer, and each clickable control badge.
+    pub playlist_hit: Option<Rect>,
+    pub browser_hit: Option<Rect>,
+    pub progress_hit: Option<Rect>,
+    pub visualizer_hit: Option<Rect>,
+    pub volume_hit: Option<Rect>,
+    pub control_hits: Vec<(Rect, MouseControl)>,
+    /// Last list click (pane, full index, `clock_secs`) for double-click detection.
+    last_click: Option<(FocusPane, usize, f64)>,
 }
 
 impl App {
@@ -322,6 +387,8 @@ impl App {
         if let Some(mode) = VisMode::from_name(&cfg.visualizer) {
             visualizer.mode = mode;
         }
+        visualizer.set_fft_size(cfg.fft_size);
+        visualizer.set_scroll_speed(cfg.scroll_speed);
         let theme = theme::by_name(&cfg.theme);
         theme::set_current(theme);
         let mut playlist_state = ListState::default();
@@ -358,6 +425,9 @@ impl App {
                 _ => RepeatMode::Off,
             },
             shuffle: cfg.shuffle,
+            gapless: cfg.gapless,
+            preloaded: None,
+            preload_tried: None,
             favorites: cfg.favorites.iter().cloned().collect(),
             recent: cfg.recent.clone(),
             play_counts: cfg.play_counts.iter().cloned().collect(),
@@ -390,10 +460,18 @@ impl App {
             url_open_supported: false,
             pending_url_open: None,
             theme,
+            truecolor: true,
             clock_secs: 0.0,
             last_video_rect: None,
             last_art_rect: None,
             last_browser_rect: None,
+            playlist_hit: None,
+            browser_hit: None,
+            progress_hit: None,
+            visualizer_hit: None,
+            volume_hit: None,
+            control_hits: Vec::new(),
+            last_click: None,
         };
         app.refresh_browser();
         app
@@ -563,6 +641,9 @@ impl App {
         if idx >= self.tracks.len() {
             return Ok(());
         }
+        // Starting a track outright rebuilds the backend's playback chain, so
+        // whatever was queued behind the old one is gone.
+        self.drop_preload();
         let source = self.tracks[idx].source.clone();
         self.current_meta = self.library.read_metadata(&source);
         if self.current_meta.artwork.is_none() {
@@ -737,6 +818,14 @@ impl App {
     }
 
     pub fn check_advance(&mut self) -> Result<()> {
+        // A queued track takes over inside the audio backend the instant the
+        // previous one runs dry. Catch that edge first, so the title, art and
+        // progress bar follow the sound rather than lead it.
+        if let Some(started) = self.audio.take_started_track()
+            && let Some(slot) = self.preloaded.take()
+        {
+            self.adopt_started(slot, started.duration)?;
+        }
         if self.playing_index.is_some() && self.audio.is_finished() {
             match self.repeat {
                 RepeatMode::One => {
@@ -747,7 +836,134 @@ impl App {
                 _ => self.next_track()?,
             }
         }
+        self.maintain_preload();
         Ok(())
+    }
+
+    /// Which playlist entry follows the playing one — the same choice
+    /// [`check_advance`](Self::check_advance) makes when a track runs out.
+    /// `None` at the end of a playlist that isn't repeating.
+    fn upcoming_slot(&self) -> Option<PreloadSlot> {
+        let current = self.playing_index?;
+        let index = match self.repeat {
+            RepeatMode::One => current,
+            RepeatMode::All if current + 1 >= self.tracks.len() => 0,
+            _ if current + 1 < self.tracks.len() => current + 1,
+            _ => return None,
+        };
+        Some(PreloadSlot {
+            index,
+            locator: self.tracks.get(index)?.source.locator(),
+        })
+    }
+
+    /// Keep the backend's gapless queue aimed at whatever should play next.
+    /// Runs every tick: it arms the queue as the current track nears its end
+    /// and rebuilds it whenever the answer changes underneath — a skip, a
+    /// seek, a reshuffle, a different repeat mode, an edited playlist.
+    fn maintain_preload(&mut self) {
+        // A seek or a manual track change rebuilds the backend's playback
+        // chain and takes the queued track with it; notice and re-arm.
+        if self.preloaded.is_some() && !self.audio.has_preload() {
+            self.preloaded = None;
+            self.preload_tried = None;
+        }
+        let upcoming = if self.gapless {
+            self.upcoming_slot()
+        } else {
+            None
+        };
+        if self.preloaded.is_some() && self.preloaded != upcoming {
+            self.audio.clear_preload();
+            self.preloaded = None;
+        }
+        if self.preload_tried.is_some() && self.preload_tried != upcoming {
+            self.preload_tried = None;
+        }
+        let Some(slot) = upcoming else {
+            return;
+        };
+        if self.preloaded.is_some() || self.preload_tried.as_ref() == Some(&slot) {
+            return;
+        }
+        // Opening a second decoder is only worth it near the seam.
+        if let Some(total) = self.current_duration {
+            let remaining = total.saturating_sub(self.audio.position()).as_secs_f64();
+            if remaining > PRELOAD_LEAD_SECS {
+                return;
+            }
+        }
+        // Video is excluded at both ends: crossing into or out of one means
+        // rebuilding the picture pipeline and subtitles, which is exactly the
+        // work a gapless handover has to skip.
+        let playing_video = self
+            .playing_index
+            .and_then(|i| self.tracks.get(i))
+            .is_some_and(|t| library::is_video(&t.source));
+        if playing_video {
+            return;
+        }
+        let Some(next) = self.tracks.get(slot.index) else {
+            return;
+        };
+        if library::is_video(&next.source) {
+            return;
+        }
+        let source = next.source.clone();
+        match self.audio.preload_next(&source) {
+            Ok(true) => self.preloaded = Some(slot),
+            // Refused or unreadable. Remember it, or a file that will never
+            // preload gets reopened on every one of the ~30 ticks a second.
+            _ => self.preload_tried = Some(slot),
+        }
+    }
+
+    /// Bring the UI across to a track the backend has already started playing.
+    /// This is [`play_index`](Self::play_index) minus the handoff to the audio
+    /// backend — and minus the video/subtitle teardown, because only audio
+    /// tracks are ever queued this way and the last `play_index` cleared those.
+    fn adopt_started(&mut self, slot: PreloadSlot, duration_hint: Option<Duration>) -> Result<()> {
+        let matches = self
+            .tracks
+            .get(slot.index)
+            .is_some_and(|t| t.source.locator() == slot.locator);
+        if !matches {
+            // The playlist changed in the moment between the handover and this
+            // tick. Rare enough to just restart cleanly from the old position.
+            return self.next_track();
+        }
+        let source = self.tracks[slot.index].source.clone();
+        self.preload_tried = None;
+        self.current_meta = self.library.read_metadata(&source);
+        if self.current_meta.artwork.is_none() {
+            if let Some(bytes) = self.library.find_cover(&source) {
+                self.current_meta.artwork = Some(bytes);
+            }
+        }
+        self.current_duration = self.current_meta.duration.or(duration_hint);
+        self.playing_index = Some(slot.index);
+        self.playing_track = Some(source.clone());
+        self.selected = slot.index;
+        self.playlist_state.select(Some(slot.index));
+        self.status = format!("Playing: {}", self.tracks[slot.index].display);
+        self.note_play(&source);
+        self.refresh_album_art();
+        Ok(())
+    }
+
+    /// Forget the queued track, here and in the backend.
+    fn drop_preload(&mut self) {
+        self.audio.clear_preload();
+        self.preloaded = None;
+        self.preload_tried = None;
+    }
+
+    pub fn toggle_gapless(&mut self) {
+        self.gapless = !self.gapless;
+        if !self.gapless {
+            self.drop_preload();
+        }
+        self.status = format!("Gapless: {}", if self.gapless { "On" } else { "Off" });
     }
 
     pub fn seek_seconds(&mut self, delta: f64) {
@@ -1027,9 +1243,12 @@ impl App {
             theme: self.theme.name.to_string(),
             volume: self.audio.volume(),
             visualizer: self.visualizer.mode.name().to_string(),
+            fft_size: self.visualizer.fft_size(),
+            scroll_speed: self.visualizer.scroll_speed(),
             last_dir: Some(self.browser_dir.to_string_lossy().to_string()),
             repeat: self.repeat.label().to_ascii_lowercase(),
             shuffle: self.shuffle,
+            gapless: self.gapless,
             playlist,
             playing_index: self.playing_index,
             position_secs: self.audio.position().as_secs_f64(),
@@ -1208,6 +1427,33 @@ impl App {
     pub fn cycle_visualizer_back(&mut self) {
         self.visualizer.toggle_mode_back();
         self.status = format!("Visualizer: {}", self.visualizer.mode.label());
+        self.save_config();
+    }
+
+    /// Step the spectrum FFT window to the next/previous supported size. Larger
+    /// windows give finer frequency resolution (esp. bass) but slower response.
+    pub fn step_fft_size(&mut self, delta: i32) {
+        let sizes = crate::visualizer::FFT_SIZES;
+        let cur = self.visualizer.fft_size();
+        let pos = sizes.iter().position(|&s| s == cur).unwrap_or(0) as i32;
+        let next = (pos + delta).clamp(0, sizes.len() as i32 - 1) as usize;
+        let size = sizes[next];
+        self.visualizer.set_fft_size(size);
+        let hz = self.audio.tap().sample_rate() as f64 / size as f64;
+        self.status = format!("FFT window: {size} samples ({hz:.1} Hz/bin)");
+        self.save_config();
+    }
+
+    /// Step the scrolling FFT visualizers' scroll speed to the next/previous
+    /// supported value (rows/columns per second).
+    pub fn step_scroll_speed(&mut self, delta: i32) {
+        let speeds = crate::visualizer::SCROLL_SPEEDS;
+        let cur = self.visualizer.scroll_speed();
+        let pos = speeds.iter().position(|&s| s == cur).unwrap_or(0) as i32;
+        let next = (pos + delta).clamp(0, speeds.len() as i32 - 1) as usize;
+        let speed = speeds[next];
+        self.visualizer.set_scroll_speed(speed);
+        self.status = format!("Scroll speed: {speed} rows/s");
         self.save_config();
     }
 
@@ -1411,6 +1657,18 @@ impl App {
                 value: self.visualizer.mode.label().to_string(),
             },
             EscapeMenuItem {
+                kind: EscapeMenuKind::FftSize,
+                enabled: true,
+                label: "FFT Resolution",
+                value: format!("{} samples", self.visualizer.fft_size()),
+            },
+            EscapeMenuItem {
+                kind: EscapeMenuKind::ScrollSpeed,
+                enabled: true,
+                label: "Scroll Speed",
+                value: format!("{} rows/s", self.visualizer.scroll_speed()),
+            },
+            EscapeMenuItem {
                 kind: EscapeMenuKind::Theme,
                 enabled: true,
                 label: "Theme",
@@ -1444,6 +1702,12 @@ impl App {
                 enabled: true,
                 label: "Shuffle",
                 value: if self.shuffle { "On" } else { "Off" }.to_string(),
+            },
+            EscapeMenuItem {
+                kind: EscapeMenuKind::Gapless,
+                enabled: true,
+                label: "Gapless",
+                value: if self.gapless { "On" } else { "Off" }.to_string(),
             },
         ];
         items.push(EscapeMenuItem {
@@ -1530,6 +1794,8 @@ impl App {
                     self.cycle_visualizer_back();
                 }
             }
+            EscapeMenuKind::FftSize => self.step_fft_size(delta),
+            EscapeMenuKind::ScrollSpeed => self.step_scroll_speed(delta),
             EscapeMenuKind::Theme => {
                 if delta > 0 {
                     self.cycle_theme();
@@ -1541,6 +1807,7 @@ impl App {
             EscapeMenuKind::VideoWindow => self.toggle_video_window(),
             EscapeMenuKind::Repeat => self.cycle_repeat(),
             EscapeMenuKind::Shuffle => self.toggle_shuffle(),
+            EscapeMenuKind::Gapless => self.toggle_gapless(),
             EscapeMenuKind::Help
             | EscapeMenuKind::Github
             | EscapeMenuKind::Quit
@@ -1577,6 +1844,7 @@ impl App {
             EscapeMenuKind::VideoWindow => self.toggle_video_window(),
             EscapeMenuKind::Repeat => self.cycle_repeat(),
             EscapeMenuKind::Shuffle => self.toggle_shuffle(),
+            EscapeMenuKind::Gapless => self.toggle_gapless(),
             EscapeMenuKind::AvOffset => self.reset_av_offset_auto(),
             _ => {}
         }
@@ -1766,6 +2034,215 @@ impl App {
         self.pending_url_open.take()
     }
 
+    /// Seek to `frac` (0..1) of the current track's duration, absolute.
+    pub fn seek_to_fraction(&mut self, frac: f64) {
+        let Some(dur) = self.current_duration else {
+            return;
+        };
+        if self.playing_index.is_none() {
+            return;
+        }
+        let target = frac.clamp(0.0, 1.0) * dur.as_secs_f64();
+        let cur = self.position().as_secs_f64();
+        self.seek_seconds(target - cur);
+    }
+
+    /// Dispatch a platform-neutral mouse event. Hit-tests against the rects the
+    /// UI recorded during the last draw. Native only for now (the web build
+    /// uses native DOM controls); harmless if the rects are unset.
+    pub fn handle_mouse(&mut self, ev: CoreMouseEvent) -> Result<()> {
+        // Modal overlays and text entry own the screen — ignore the mouse.
+        if self.show_help
+            || self.show_escape_menu
+            || self.show_search
+            || self.input_mode != InputMode::Normal
+        {
+            return Ok(());
+        }
+        let (col, row) = (ev.col, ev.row);
+        match ev.kind {
+            CoreMouseKind::ScrollUp | CoreMouseKind::ScrollDown => {
+                let delta = if ev.kind == CoreMouseKind::ScrollUp { -3 } else { 3 };
+                if rect_hit(self.playlist_hit, col, row) {
+                    self.scroll_pane(FocusPane::Playlist, delta);
+                } else if rect_hit(self.browser_hit, col, row) {
+                    self.scroll_pane(FocusPane::Browser, delta);
+                } else if rect_hit(self.visualizer_hit, col, row) {
+                    // Scrolling over the visualizer nudges the volume.
+                    self.volume_step(if delta < 0 { 0.05 } else { -0.05 });
+                }
+            }
+            CoreMouseKind::Down => {
+                // Seek bar takes priority (it can overlap the now-playing panel).
+                if rect_hit(self.progress_hit, col, row) {
+                    self.seek_to_fraction(self.frac_at(self.progress_hit, col));
+                    return Ok(());
+                }
+                // Clickable control badges.
+                let mut control = None;
+                for (r, c) in &self.control_hits {
+                    if rect_hit(Some(*r), col, row) {
+                        control = Some(*c);
+                        break;
+                    }
+                }
+                if let Some(c) = control {
+                    self.apply_mouse_control(c)?;
+                    return Ok(());
+                }
+                // Volume column: set level from the click height.
+                if let Some(r) = self.volume_hit.filter(|r| rect_hit(Some(*r), col, row)) {
+                    self.set_volume_abs(self.volume_at_row(r, row), true);
+                    return Ok(());
+                }
+                // Clicking the visualizer switches to the next mode.
+                if rect_hit(self.visualizer_hit, col, row) {
+                    self.cycle_visualizer();
+                    return Ok(());
+                }
+                if let Some(r) = self.playlist_hit.filter(|r| rect_hit(Some(*r), col, row)) {
+                    self.click_list(FocusPane::Playlist, r, row)?;
+                    return Ok(());
+                }
+                if let Some(r) = self.browser_hit.filter(|r| rect_hit(Some(*r), col, row)) {
+                    self.click_list(FocusPane::Browser, r, row)?;
+                }
+            }
+            CoreMouseKind::Drag => {
+                // Dragging in the volume column tracks the level (column-gated,
+                // so it never collides with the seek bar's row-gated scrub).
+                if let Some(r) = self
+                    .volume_hit
+                    .filter(|r| col >= r.x && col < r.x.saturating_add(r.width))
+                {
+                    self.set_volume_abs(self.volume_at_row(r, row), false);
+                    return Ok(());
+                }
+                // Scrub the seek bar: accept any drag on the bar's row(s).
+                if let Some(r) = self
+                    .progress_hit
+                    .filter(|r| row >= r.y && row < r.y.saturating_add(r.height.max(1)))
+                {
+                    self.seek_to_fraction(self.frac_at(Some(r), col));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fraction (0..1) of a horizontal rect that `col` lands at, clamped.
+    fn frac_at(&self, rect: Option<Rect>, col: u16) -> f64 {
+        let Some(r) = rect else { return 0.0 };
+        if r.width == 0 {
+            return 0.0;
+        }
+        let cx = col.clamp(r.x, r.x + r.width - 1);
+        (cx - r.x) as f64 / r.width as f64
+    }
+
+    /// Move a pane's selection by `delta` visible rows, clamped (no wrap), for
+    /// the scroll wheel. Leaves focus untouched so scrolling doesn't steal it.
+    fn scroll_pane(&mut self, pane: FocusPane, delta: i32) {
+        let vis = self.visible_indices(pane);
+        if vis.is_empty() {
+            return;
+        }
+        let cur = self.selection(pane);
+        let pos = vis.iter().position(|&i| i == cur).unwrap_or(0) as i32;
+        let new_pos = (pos + delta).clamp(0, vis.len() as i32 - 1) as usize;
+        self.set_selection(pane, vis[new_pos]);
+    }
+
+    /// Handle a click on a list row: focus the pane and select the row; a
+    /// second click on the same row within the double-click window activates it
+    /// (play the track / enter the directory).
+    fn click_list(&mut self, pane: FocusPane, inner: Rect, row: u16) -> Result<()> {
+        let vis = self.visible_indices(pane);
+        if vis.is_empty() {
+            self.focus = pane;
+            return Ok(());
+        }
+        let offset = match pane {
+            FocusPane::Playlist => self.playlist_state.offset(),
+            FocusPane::Browser => self.browser_state.offset(),
+        };
+        let vis_idx = offset + (row - inner.y) as usize;
+        self.focus = pane;
+        let Some(&full_idx) = vis.get(vis_idx) else {
+            return Ok(()); // click below the last row
+        };
+        self.set_selection(pane, full_idx);
+        let now = self.clock_secs;
+        let double = matches!(
+            self.last_click,
+            Some((p, i, t)) if p == pane && i == full_idx && now - t < 0.45
+        );
+        if double {
+            self.last_click = None;
+            self.activate_selection()?;
+        } else {
+            self.last_click = Some((pane, full_idx, now));
+        }
+        Ok(())
+    }
+
+    /// Volume (0..1.5) for a click at `row` in the vertical volume bar `r`:
+    /// top of the bar is full, bottom is muted.
+    fn volume_at_row(&self, r: Rect, row: u16) -> f32 {
+        if r.height <= 1 {
+            return self.audio.volume();
+        }
+        let ry = row.clamp(r.y, r.y + r.height - 1);
+        let frac_from_top = (ry - r.y) as f32 / (r.height - 1) as f32;
+        ((1.0 - frac_from_top) * 1.5).clamp(0.0, 1.5)
+    }
+
+    /// Set the volume to an absolute level. `persist` writes the config (used on
+    /// the initial click, but skipped mid-drag to avoid thrashing the file).
+    fn set_volume_abs(&mut self, v: f32, persist: bool) {
+        let v = v.clamp(0.0, 1.5);
+        self.audio.set_volume(v);
+        self.status = format!("Volume: {:>3.0}%", v * 100.0);
+        if persist {
+            self.save_config();
+        }
+    }
+
+    fn apply_mouse_control(&mut self, control: MouseControl) -> Result<()> {
+        match control {
+            MouseControl::SeekBack => self.seek_seconds(-10.0),
+            MouseControl::Stop => self.stop_playback(),
+            MouseControl::PlayPause => {
+                // Cassette Play: resume/pause, or start the selection if stopped.
+                if self.playing_index.is_none() {
+                    if !self.tracks.is_empty() {
+                        self.play_index(self.selected)?;
+                    }
+                } else {
+                    self.audio.toggle_pause();
+                }
+            }
+            MouseControl::SeekForward => self.seek_seconds(10.0),
+            MouseControl::CycleRepeat => self.cycle_repeat(),
+            MouseControl::ToggleShuffle => self.toggle_shuffle(),
+            MouseControl::ToggleFavorite => self.toggle_favorite(),
+            MouseControl::CycleSubtitle => self.cycle_subtitle_track(),
+        }
+        Ok(())
+    }
+
+    /// Stop playback: halt audio and any video, and clear the "now playing"
+    /// state (the selection is kept, so the Play button restarts from it).
+    pub fn stop_playback(&mut self) {
+        self.audio.stop();
+        self.playing_index = None;
+        self.playing_track = None;
+        if self.video.is_loaded() {
+            self.video.close();
+        }
+        self.status = String::from("Stopped");
+    }
+
     /// Dispatch a platform-neutral key event. Shared by both builds so the
     /// keymap stays identical.
     pub fn handle_key(&mut self, ev: CoreKeyEvent) -> Result<()> {
@@ -1927,6 +2404,17 @@ impl App {
 fn fmt_short(d: Duration) -> String {
     let s = d.as_secs();
     format!("{:02}:{:02}", s / 60, s % 60)
+}
+
+/// Whether the cell `(col, row)` falls inside `rect` (if set).
+fn rect_hit(rect: Option<Rect>, col: u16, row: u16) -> bool {
+    match rect {
+        Some(r) => {
+            col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y
+                && row < r.y.saturating_add(r.height)
+        }
+        None => false,
+    }
 }
 
 fn plural_s(n: usize) -> &'static str {

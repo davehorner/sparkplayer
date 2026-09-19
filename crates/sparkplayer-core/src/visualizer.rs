@@ -5,8 +5,33 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 use crate::audio_tap::SampleBuffer;
 
-const FFT_SIZE: usize = 1024;
+/// Default FFT window size, shared by every spectrum visualization and tunable
+/// from the settings dialog. Larger = finer frequency resolution (most visible
+/// in the bass, where a small FFT's wide bins smear everything together) at the
+/// cost of time resolution / beat responsiveness. At 44.1 kHz, 8192 samples is
+/// ~5.4 Hz per bin over a ~186 ms window.
+pub const FFT_DEFAULT_SIZE: usize = 8192;
+const FFT_MIN_SIZE: usize = 1024;
+const FFT_MAX_SIZE: usize = 16384;
+/// Selectable FFT sizes for the settings dialog (powers of two). The largest
+/// must satisfy `2 * size <= TAP_CAPACITY` so a stereo window isn't truncated.
+pub const FFT_SIZES: &[usize] = &[1024, 2048, 4096, 8192, 16384];
 const WAVE_SIZE: usize = 2048;
+
+/// Graphics waterfall image: frequency bins across (width), time rows down
+/// (height, newest on top). Scaled to the panel by the graphics backend.
+const WATERFALL_BINS: usize = 256;
+const WATERFALL_ROWS: usize = 192;
+const WATERFALL_DB_FLOOR: f32 = -72.0;
+const WATERFALL_DB_RANGE: f32 = 70.0;
+
+/// Scroll rate (new rows/columns per second) shared by the time-frequency
+/// visualizers (waterfall, text waterfall, spectrogram, 3D spectrum). Applied
+/// as a wall-clock gate so the scroll is smooth and independent of the redraw
+/// rate. User-tunable from the settings dialog.
+pub const SCROLL_SPEED_DEFAULT: u32 = 30;
+/// Selectable scroll speeds for the settings dialog (rows/columns per second).
+pub const SCROLL_SPEEDS: &[u32] = &[8, 15, 30, 45, 60];
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VisMode {
@@ -16,6 +41,8 @@ pub enum VisMode {
     Waveform,
     ScrollingWaveform,
     Spectrogram,
+    Waterfall,
+    WaterfallText,
     Lissajous,
     Vu,
     Spectrum3D,
@@ -32,6 +59,8 @@ impl VisMode {
             VisMode::Waveform => "Waveform",
             VisMode::ScrollingWaveform => "Scrolling Wave",
             VisMode::Spectrogram => "Spectrogram",
+            VisMode::Waterfall => "Waterfall",
+            VisMode::WaterfallText => "Waterfall (Text)",
             VisMode::Lissajous => "Stereo X/Y",
             VisMode::Vu => "VU Meters",
             VisMode::Spectrum3D => "Spectrum 3D",
@@ -46,7 +75,9 @@ impl VisMode {
             VisMode::Radial => VisMode::Waveform,
             VisMode::Waveform => VisMode::ScrollingWaveform,
             VisMode::ScrollingWaveform => VisMode::Spectrogram,
-            VisMode::Spectrogram => VisMode::Lissajous,
+            VisMode::Spectrogram => VisMode::Waterfall,
+            VisMode::Waterfall => VisMode::WaterfallText,
+            VisMode::WaterfallText => VisMode::Lissajous,
             VisMode::Lissajous => VisMode::Vu,
             VisMode::Vu => VisMode::Spectrum3D,
             VisMode::Spectrum3D => VisMode::Plasma,
@@ -62,7 +93,9 @@ impl VisMode {
             VisMode::Waveform => VisMode::Radial,
             VisMode::ScrollingWaveform => VisMode::Waveform,
             VisMode::Spectrogram => VisMode::ScrollingWaveform,
-            VisMode::Lissajous => VisMode::Spectrogram,
+            VisMode::Waterfall => VisMode::Spectrogram,
+            VisMode::WaterfallText => VisMode::Waterfall,
+            VisMode::Lissajous => VisMode::WaterfallText,
             VisMode::Vu => VisMode::Lissajous,
             VisMode::Spectrum3D => VisMode::Vu,
             VisMode::Plasma => VisMode::Spectrum3D,
@@ -78,6 +111,8 @@ impl VisMode {
             VisMode::Waveform => "waveform",
             VisMode::ScrollingWaveform => "scrolling-wave",
             VisMode::Spectrogram => "spectrogram",
+            VisMode::Waterfall => "waterfall",
+            VisMode::WaterfallText => "waterfall-text",
             VisMode::Lissajous => "lissajous",
             VisMode::Vu => "vu",
             VisMode::Spectrum3D => "spectrum-3d",
@@ -93,6 +128,8 @@ impl VisMode {
             "waveform" => VisMode::Waveform,
             "scrolling-wave" => VisMode::ScrollingWaveform,
             "spectrogram" => VisMode::Spectrogram,
+            "waterfall" => VisMode::Waterfall,
+            "waterfall-text" => VisMode::WaterfallText,
             "lissajous" => VisMode::Lissajous,
             "vu" => VisMode::Vu,
             "spectrum-3d" => VisMode::Spectrum3D,
@@ -104,6 +141,8 @@ impl VisMode {
 }
 
 pub struct Visualizer {
+    /// Current FFT window size (power of two); reconfigured via `set_fft_size`.
+    fft_size: usize,
     fft: Arc<dyn Fft<f32>>,
     window: Vec<f32>,
     window_sum: f32,
@@ -113,6 +152,16 @@ pub struct Visualizer {
     smoothed_bars: Vec<f32>,
     pub scroll_wave: VecDeque<f32>,
     pub spectrogram_cols: VecDeque<Vec<f32>>,
+    /// New rows/columns per second for the scrolling FFT views; gated on the
+    /// wall clock via the `*_last_secs` watermarks below.
+    scroll_speed: u32,
+    spectrogram_last_secs: Option<f64>,
+    spectrum_3d_last_secs: Option<f64>,
+    /// Time-ordered magnitude rows for the waterfall (oldest front, newest
+    /// back), the RGB image built from them, and the clock of the last row.
+    waterfall_rows: VecDeque<Vec<f32>>,
+    waterfall_img: Vec<u8>,
+    waterfall_last_secs: Option<f64>,
     last_consumed_for_scroll: u64,
     stereo_samples: Vec<(f32, f32)>,
     pub spectrum_3d_rows: VecDeque<Vec<f32>>,
@@ -144,27 +193,126 @@ pub struct Levels {
     pub correlation: f32,
 }
 
+/// Reduce a half-spectrum magnitude slice into `bins` log-spaced bands, each a
+/// normalized 0..1 value mapped from `db_floor..(db_floor + db_range)` dBFS.
+/// The frequency→bin mapping uses `mags.len()`, so a longer FFT (more bins)
+/// automatically yields finer resolution — especially in the low end.
+fn log_bin_db_from(
+    mags: &[f32],
+    bins: usize,
+    sample_rate: u32,
+    db_floor: f32,
+    db_range: f32,
+) -> Vec<f32> {
+    let half = mags.len().max(1);
+    let sr = sample_rate.max(1) as f32;
+    let nyquist = sr * 0.5;
+    let f_min = 30.0f32;
+    let f_max = nyquist.min(16000.0);
+    let mut out = vec![0.0f32; bins];
+    for b in 0..bins {
+        let t0 = b as f32 / bins as f32;
+        let t1 = (b + 1) as f32 / bins as f32;
+        let f0 = f_min * (f_max / f_min).powf(t0);
+        let f1 = f_min * (f_max / f_min).powf(t1);
+        let i0 = (((f0 / nyquist) * half as f32).floor() as usize).min(half - 1);
+        let i1 = (((f1 / nyquist) * half as f32).ceil() as usize)
+            .min(half)
+            .max(i0 + 1);
+        // Sum power across the band, then take amplitude.
+        let mut power = 0.0f32;
+        for v in &mags[i0..i1] {
+            power += v * v;
+        }
+        let amp = power.sqrt();
+        let db = 20.0 * (amp.max(1e-7)).log10();
+        out[b] = ((db - db_floor) / db_range).clamp(0.0, 1.0);
+    }
+    out
+}
+
+/// Plan a forward FFT of `size` and build its matching Hann window (returned
+/// with the window's coherent-gain sum).
+fn plan_fft(size: usize) -> (Arc<dyn Fft<f32>>, Vec<f32>, f32) {
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(size);
+    let window: Vec<f32> = (0..size)
+        .map(|i| {
+            let x = i as f32 / (size - 1).max(1) as f32;
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()
+        })
+        .collect();
+    let window_sum = window.iter().sum();
+    (fft, window, window_sum)
+}
+
+/// Snap a requested FFT size to a supported power of two within range.
+pub fn clamp_fft_size(size: usize) -> usize {
+    let size = size.clamp(FFT_MIN_SIZE, FFT_MAX_SIZE);
+    let mut p = FFT_MIN_SIZE;
+    while p * 2 <= size {
+        p *= 2;
+    }
+    p
+}
+
+/// Snap a requested scroll speed to the nearest supported value.
+pub fn clamp_scroll_speed(speed: u32) -> u32 {
+    SCROLL_SPEEDS
+        .iter()
+        .copied()
+        .min_by_key(|&s| s.abs_diff(speed))
+        .unwrap_or(SCROLL_SPEED_DEFAULT)
+}
+
+/// Map a normalized magnitude (0..1) to the classic SDR waterfall gradient:
+/// dark blue → blue → cyan → green → yellow → orange → red → white.
+pub(crate) fn waterfall_color(t: f32) -> (u8, u8, u8) {
+    const STOPS: [(f32, (u8, u8, u8)); 9] = [
+        (0.00, (6, 8, 45)),      // near-black deep blue (noise floor)
+        (0.14, (16, 42, 135)),   // blue
+        (0.30, (0, 120, 190)),   // cyan-blue
+        (0.45, (0, 190, 120)),   // green
+        (0.60, (170, 215, 40)),  // yellow-green
+        (0.74, (245, 220, 45)),  // yellow
+        (0.85, (245, 140, 30)),  // orange
+        (0.94, (225, 45, 35)),   // red
+        (1.00, (255, 255, 255)), // white (peaks)
+    ];
+    let t = t.clamp(0.0, 1.0);
+    for i in 1..STOPS.len() {
+        if t <= STOPS[i].0 {
+            let (lo, hi) = (STOPS[i - 1].0, STOPS[i].0);
+            let k = if hi > lo { (t - lo) / (hi - lo) } else { 0.0 };
+            let (r1, g1, b1) = STOPS[i - 1].1;
+            let (r2, g2, b2) = STOPS[i].1;
+            let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * k) as u8;
+            return (lerp(r1, r2), lerp(g1, g2), lerp(b1, b2));
+        }
+    }
+    STOPS[STOPS.len() - 1].1
+}
+
 impl Visualizer {
     pub fn new() -> Self {
-        let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let window: Vec<f32> = (0..FFT_SIZE)
-            .map(|i| {
-                let x = i as f32 / (FFT_SIZE - 1) as f32;
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * x).cos()
-            })
-            .collect();
-        let window_sum: f32 = window.iter().sum();
+        let fft_size = FFT_DEFAULT_SIZE;
+        let (fft, window, window_sum) = plan_fft(fft_size);
         Self {
+            fft_size,
             fft,
             window,
             window_sum,
-            samples: vec![0.0; FFT_SIZE.max(WAVE_SIZE)],
-            spectrum_buf: vec![Complex32::new(0.0, 0.0); FFT_SIZE],
-            mags: vec![0.0; FFT_SIZE / 2],
+            samples: vec![0.0; fft_size.max(WAVE_SIZE)],
+            spectrum_buf: vec![Complex32::new(0.0, 0.0); fft_size],
+            mags: vec![0.0; fft_size / 2],
             smoothed_bars: Vec::new(),
             scroll_wave: VecDeque::new(),
             spectrogram_cols: VecDeque::new(),
+            scroll_speed: SCROLL_SPEED_DEFAULT,
+            spectrogram_last_secs: None,
+            spectrum_3d_last_secs: None,
+            waterfall_rows: VecDeque::new(),
+            waterfall_img: vec![0; WATERFALL_BINS * WATERFALL_ROWS * 3],
+            waterfall_last_secs: None,
             last_consumed_for_scroll: 0,
             stereo_samples: Vec::new(),
             spectrum_3d_rows: VecDeque::new(),
@@ -181,6 +329,76 @@ impl Visualizer {
             last_consumed_for_plasma: 0,
             mode: VisMode::Spectrum,
         }
+    }
+
+    /// The active FFT window size.
+    pub fn fft_size(&self) -> usize {
+        self.fft_size
+    }
+
+    /// Reconfigure the FFT window size (snapped to a supported power of two),
+    /// rebuilding the plan, window, and work buffers. Scrolling history is kept
+    /// as-is — it stores display bins, whose count is independent of FFT size.
+    pub fn set_fft_size(&mut self, size: usize) {
+        let size = clamp_fft_size(size);
+        if size == self.fft_size {
+            return;
+        }
+        let (fft, window, window_sum) = plan_fft(size);
+        self.fft = fft;
+        self.window = window;
+        self.window_sum = window_sum;
+        self.fft_size = size;
+        if self.samples.len() < size.max(WAVE_SIZE) {
+            self.samples.resize(size.max(WAVE_SIZE), 0.0);
+        }
+        self.spectrum_buf = vec![Complex32::new(0.0, 0.0); size];
+        self.mags = vec![0.0; size / 2];
+    }
+
+    /// The active scroll speed (rows/columns per second) of the time-frequency
+    /// visualizers.
+    pub fn scroll_speed(&self) -> u32 {
+        self.scroll_speed
+    }
+
+    /// Set the scroll speed (snapped to a supported value).
+    pub fn set_scroll_speed(&mut self, speed: u32) {
+        self.scroll_speed = clamp_scroll_speed(speed);
+    }
+
+    /// How many scroll steps have elapsed since `*watermark` at the current
+    /// scroll rate, advancing the watermark. Caps the burst (`max`) so a long
+    /// stall or clock jump can't dump a screenful at once, and re-seeds on the
+    /// first tick and while paused so the timeline doesn't lurch on resume.
+    fn scroll_steps(
+        watermark: &mut Option<f64>,
+        scroll_dt: f64,
+        active: bool,
+        now_secs: f64,
+        max: usize,
+    ) -> usize {
+        let last = match *watermark {
+            Some(last) if active => last,
+            _ => {
+                *watermark = Some(now_secs);
+                return 0;
+            }
+        };
+        let dt = scroll_dt.max(1.0e-3);
+        let mut t = last;
+        let mut steps = 0;
+        while now_secs - t >= dt && steps < max {
+            t += dt;
+            steps += 1;
+        }
+        *watermark = Some(if steps == max { now_secs } else { t });
+        steps
+    }
+
+    /// Seconds between scroll steps at the current scroll speed.
+    fn scroll_dt(&self) -> f64 {
+        1.0 / self.scroll_speed.max(1) as f64
     }
 
     /// Seconds of audio played since `watermark` was last updated, syncing the
@@ -218,16 +436,17 @@ impl Visualizer {
     }
 
     fn compute_fft(&mut self, tap: &SampleBuffer) {
-        if self.samples.len() < FFT_SIZE {
-            self.samples.resize(FFT_SIZE, 0.0);
+        let n = self.fft_size;
+        if self.samples.len() < n {
+            self.samples.resize(n, 0.0);
         }
-        let _ = tap.latest_mono(&mut self.samples[..FFT_SIZE]);
-        for i in 0..FFT_SIZE {
+        let _ = tap.latest_mono(&mut self.samples[..n]);
+        for i in 0..n {
             let s = self.samples[i] * self.window[i];
             self.spectrum_buf[i] = Complex32::new(s, 0.0);
         }
         self.fft.process(&mut self.spectrum_buf);
-        let half = FFT_SIZE / 2;
+        let half = n / 2;
         // Coherent normalization: full-scale sine -> magnitude 1.0 in its bin.
         let scale = 2.0 / self.window_sum;
         for i in 0..half {
@@ -240,32 +459,7 @@ impl Visualizer {
     /// Reduce the half-spectrum into `bins` log-spaced bands, returning each as
     /// a normalized 0..1 value mapped from `db_floor..(db_floor + db_range)` dBFS.
     fn log_bin_db(&self, bins: usize, sample_rate: u32, db_floor: f32, db_range: f32) -> Vec<f32> {
-        let half = FFT_SIZE / 2;
-        let sr = sample_rate.max(1) as f32;
-        let nyquist = sr * 0.5;
-        let f_min = 30.0f32;
-        let f_max = nyquist.min(16000.0);
-        let mut out = vec![0.0f32; bins];
-        for b in 0..bins {
-            let t0 = b as f32 / bins as f32;
-            let t1 = (b + 1) as f32 / bins as f32;
-            let f0 = f_min * (f_max / f_min).powf(t0);
-            let f1 = f_min * (f_max / f_min).powf(t1);
-            let i0 = ((f0 / nyquist) * half as f32).floor() as usize;
-            let i1 = ((f1 / nyquist) * half as f32).ceil() as usize;
-            let i0 = i0.min(half - 1);
-            let i1 = i1.min(half).max(i0 + 1);
-            // Sum power across the band, then take amplitude.
-            let mut power = 0.0f32;
-            for v in &self.mags[i0..i1] {
-                power += v * v;
-            }
-            let amp = power.sqrt();
-            let db = 20.0 * (amp.max(1e-7)).log10();
-            let n = ((db - db_floor) / db_range).clamp(0.0, 1.0);
-            out[b] = n;
-        }
-        out
+        log_bin_db_from(&self.mags, bins, sample_rate, db_floor, db_range)
     }
 
     /// Spectrum bars: smoothed log-binned FFT mapped to 0..1.
@@ -407,18 +601,98 @@ impl Visualizer {
         height: usize,
         sample_rate: u32,
         active: bool,
+        now_secs: f64,
     ) -> Vec<Vec<f32>> {
-        if active {
+        let cap = width.max(2);
+        let dt = self.scroll_dt();
+        let steps = Self::scroll_steps(&mut self.spectrogram_last_secs, dt, active, now_secs, cap);
+        for _ in 0..steps {
             self.compute_fft(tap);
             // Slightly tighter dynamic range than the bars so colors saturate nicely.
             let col = self.log_bin_db(height, sample_rate, -70.0, 65.0);
             self.spectrogram_cols.push_back(col);
         }
-        let cap = width.max(2);
         while self.spectrogram_cols.len() > cap {
             self.spectrogram_cols.pop_front();
         }
         self.spectrogram_cols.iter().cloned().collect()
+    }
+
+    /// Advance the waterfall: append new FFT rows for the time elapsed since the
+    /// last one (steady ~30 rows/s, independent of redraw rate) and rebuild the
+    /// RGB image. Returns the image dimensions `(width, height)` in pixels; the
+    /// pixels themselves are read via [`Self::waterfall_pixels`]. `now_secs` is
+    /// the platform wall clock.
+    /// Append fresh FFT rows to the waterfall history for the real time elapsed
+    /// since the last one (steady ~30 rows/s, independent of redraw rate).
+    /// Shared by the graphical waterfall and the text waterfall.
+    pub fn waterfall_advance(
+        &mut self,
+        tap: &SampleBuffer,
+        sample_rate: u32,
+        active: bool,
+        now_secs: f64,
+    ) {
+        let dt = self.scroll_dt();
+        let steps =
+            Self::scroll_steps(&mut self.waterfall_last_secs, dt, active, now_secs, WATERFALL_ROWS);
+        for _ in 0..steps {
+            self.compute_fft(tap);
+            let row = self.log_bin_db(
+                WATERFALL_BINS,
+                sample_rate,
+                WATERFALL_DB_FLOOR,
+                WATERFALL_DB_RANGE,
+            );
+            self.waterfall_rows.push_back(row);
+        }
+        while self.waterfall_rows.len() > WATERFALL_ROWS {
+            self.waterfall_rows.pop_front();
+        }
+    }
+
+    /// Advance the waterfall and rebuild its RGB image. Returns the image
+    /// dimensions `(width, height)` in pixels; read the pixels via
+    /// [`Self::waterfall_pixels`].
+    pub fn waterfall(
+        &mut self,
+        tap: &SampleBuffer,
+        sample_rate: u32,
+        active: bool,
+        now_secs: f64,
+    ) -> (u32, u32) {
+        self.waterfall_advance(tap, sample_rate, active, now_secs);
+        self.rebuild_waterfall_image();
+        (WATERFALL_BINS as u32, WATERFALL_ROWS as u32)
+    }
+
+    /// The current waterfall image as row-major RGB8, `WATERFALL_BINS` wide.
+    pub fn waterfall_pixels(&self) -> &[u8] {
+        &self.waterfall_img
+    }
+
+    /// The raw magnitude rows (oldest first), for the cell-based waterfalls.
+    pub fn waterfall_rows(&self) -> &VecDeque<Vec<f32>> {
+        &self.waterfall_rows
+    }
+
+    /// Repaint `waterfall_img` from `waterfall_rows`, newest row on top. Rows
+    /// not yet filled show the palette's floor color (dark blue).
+    fn rebuild_waterfall_image(&mut self) {
+        let rows = &self.waterfall_rows;
+        let n = rows.len();
+        for y in 0..WATERFALL_ROWS {
+            // y = 0 is the top = newest row.
+            let row = if y < n { Some(&rows[n - 1 - y]) } else { None };
+            for x in 0..WATERFALL_BINS {
+                let mag = row.and_then(|r| r.get(x)).copied().unwrap_or(0.0);
+                let (r, g, b) = waterfall_color(mag);
+                let idx = (y * WATERFALL_BINS + x) * 3;
+                self.waterfall_img[idx] = r;
+                self.waterfall_img[idx + 1] = g;
+                self.waterfall_img[idx + 2] = b;
+            }
+        }
     }
 
     /// Latest stereo frames for an X/Y oscillogram. Returns a slice of (L, R)
@@ -454,13 +728,16 @@ impl Visualizer {
         sample_rate: u32,
         depth: usize,
         active: bool,
+        now_secs: f64,
     ) -> Vec<Vec<f32>> {
-        if active {
+        let cap = depth.max(2);
+        let dt = self.scroll_dt();
+        let steps = Self::scroll_steps(&mut self.spectrum_3d_last_secs, dt, active, now_secs, cap);
+        for _ in 0..steps {
             self.compute_fft(tap);
             let col = self.log_bin_db(bins, sample_rate, -75.0, 70.0);
             self.spectrum_3d_rows.push_back(col);
         }
-        let cap = depth.max(2);
         while self.spectrum_3d_rows.len() > cap {
             self.spectrum_3d_rows.pop_front();
         }

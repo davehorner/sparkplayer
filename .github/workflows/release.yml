@@ -111,7 +111,17 @@ jobs:
           # Tell bindgen which arch we are targeting so it loads the right
           # libavutil/avconfig.h from /usr/include/<triple>/.
           BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu: "--target=aarch64-linux-gnu -I/usr/include/aarch64-linux-gnu"
-          BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf: "--target=arm-linux-gnueabihf -I/usr/include/arm-linux-gnueabihf"
+          # The trailing -D disables C static assertions while bindgen parses
+          # headers, which is needed on 32-bit only. ffmpeg-sys-next 9.0's
+          # Vulkan shim (hwcontext_stubs/vulkan/vulkan.h) asserts
+          # sizeof(VkPhysicalDeviceFeatures2) == 240 — true for a 64-bit
+          # pointer, but the struct is 228 bytes on armv7, so bindgen aborts.
+          # The shim's *layout* is right for 32-bit (it matches the real
+          # Vulkan header there); only the hard-coded constant is wrong, so
+          # the generated bindings are unaffected. Assertions are compile-time
+          # checks in headers bindgen only reads, never compiles. Drop this
+          # once ffmpeg-sys-next makes that assertion pointer-width aware.
+          BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf: "--target=arm-linux-gnueabihf -I/usr/include/arm-linux-gnueabihf -D_Static_assert(c,m)="
         run: cross build --release --locked --target ${{ matrix.target }}
 
       - name: Install cargo-deb
@@ -165,16 +175,27 @@ jobs:
       - name: Install FFmpeg (shared dev build)
         shell: pwsh
         run: |
-          # Prebuilt FFmpeg shared dev build from gyan.dev (LGPL).
+          # Prebuilt FFmpeg shared build from gyan.dev.
           # ffmpeg-sys-next looks for $FFMPEG_DIR/include and $FFMPEG_DIR/lib.
-          # Pinned to a specific version so the soname-versioned DLL names
-          # (avcodec-62.dll, avutil-60.dll, ...) are deterministic and match
-          # the names hard-coded in wix/main.wxs. Bumping this requires
-          # updating those names in the WiX source too.
-          $url = 'https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-full_build-shared.7z'
+          # Use the stable "latest release" URL, NOT a version-pinned one: gyan.dev
+          # prunes old versioned packages from /packages/ on every release, which
+          # repeatedly 404s this step. The soname-versioned DLL names
+          # (avcodec-63.dll, avutil-61.dll, ...) are stable within an FFmpeg major
+          # series and are hard-coded in wix/main.wxs; a major bump changes them,
+          # and the check below fails loudly with the actual names when it does.
+          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z'
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.7z -UseBasicParsing
           7z x ffmpeg.7z -offmpeg-dist -y | Out-Null
           $root = (Get-ChildItem ffmpeg-dist -Directory | Select-Object -First 1).FullName
+          # Fail early (with the actual names) if the DLL sonames drift from what
+          # wix/main.wxs bundles, rather than a cryptic failure at the MSI step.
+          $expected = 'avcodec-63.dll','avformat-63.dll','avutil-61.dll','swresample-7.dll','swscale-10.dll'
+          $have = (Get-ChildItem "$root\bin" -Filter *.dll).Name
+          $missing = $expected | Where-Object { $_ -notin $have }
+          if ($missing) {
+            Write-Host "FFmpeg DLLs present in bin:`n  $($have -join "`n  ")"
+            throw "FFmpeg DLL soname mismatch (missing: $($missing -join ', ')). Update wix/main.wxs to match the names above."
+          }
           echo "FFMPEG_DIR=$root" >> $env:GITHUB_ENV
           # libclang is needed by bindgen (used by ffmpeg-sys-next).
           # GitHub's windows-latest image ships LLVM under C:\Program Files\LLVM.

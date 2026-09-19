@@ -74,9 +74,22 @@ large library; `Esc` clears the filter. Curate the playlist in place with `d`
 
 Launched with no arguments, SparkPlayer reopens where you left off: the same
 browser directory and playlist, the track and position that were playing, and
-your repeat/shuffle modes. Pass a path explicitly to start fresh from it
+your repeat/shuffle/gapless modes. Pass a path explicitly to start fresh from it
 instead. (In the browser build, settings and repeat/shuffle persist via
 `localStorage`; locally-picked files can't be restored across reloads.)
+
+### Gapless playback
+
+Between two audio tracks SparkPlayer hands the next one to the audio device
+before the current one runs out, so albums that were mastered to run together —
+live recordings, DJ sets, anything that fades one track into the next — play
+without the pause that opening the next file would otherwise cost. The queued
+track is converted to the playing track's format up front, so a playlist that
+mixes sample rates stays gapless too.
+
+It is on by default and toggled from the `Esc` menu (*Gapless*); the setting is
+remembered between runs. Video is always started the normal way, since its
+picture pipeline and subtitles have to be rebuilt at the boundary anyway.
 
 ### Album art
 
@@ -130,8 +143,8 @@ terminal does not implement Sixel, Kitty, or iTerm2 inline images.
 
 `--bespoke-shm[=NAME]` publishes decoded audio to a stereo `f32` ring buffer for
 Bespoke/Awisp-style visualizer integrations. The bridge is opt-in and
-best-effort: if the mapping cannot be created, SparkPlayer prints a warning and
-continues without it.
+best-effort: if the mapping cannot be created, SparkPlayer shows a warning in
+the status line and continues without it.
 
 When `NAME` is omitted the stream name is `/sparkplayer_audio` on Unix-like
 systems and `Local\SparkPlayerAudio` on Windows. Only one SparkPlayer process
@@ -139,10 +152,23 @@ may own a given name at a time; a second process using the same name disables
 its bridge instead of replacing or clearing the existing stream.
 
 The shared header starts with magic `SPRK`, version `1`, fixed stereo output,
-`sample_rate`, `write_frame`, `total_frames`, and `generation`. Consumers should
-read `generation` before and after copying the header/ring data and retry if it
-changed; SparkPlayer increments it when the stream is reset or the sample rate
-changes.
+`sample_rate`, `write_frame`, `total_frames`, and `generation`. Audio frames are
+published by a release store to `write_frame`; consumers must load it with
+acquire semantics before reading the corresponding stereo `f32` frames.
+`generation` is an even-valued stream epoch. Consumers should read it before
+and after copying data, retry when it is odd or changed, and discard positions
+from an older epoch. Ring samples are not cleared between epochs.
+
+The mapping also carries a Bespoke-to-SparkPlayer control channel. A producer
+writes `transport_state` (`1` = play, `2` = pause) and then release-stores a new
+`transport_sequence`. Visualizer changes use `visualizer_delta` followed by a
+release store to `visualizer_sequence`. SparkPlayer acquire-loads each sequence
+and applies a command once whenever it changes.
+
+Writer ownership is held by an OS lock rather than by the lifetime of the
+mapping. This allows Unix mappings to survive a crash or SparkPlayer's direct
+process exit while still preventing two SparkPlayer processes from publishing
+to the same stream simultaneously.
 
 ## Keyboard shortcuts
 
@@ -257,7 +283,7 @@ prebuilt libraries with a few environment variables (this is exactly what CI
 does in `.github/workflows/release.yml`). One-time setup:
 
 1. **FFmpeg shared dev build** — download
-   [`ffmpeg-8.1.1-full_build-shared.7z`](https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-full_build-shared.7z)
+   [`ffmpeg-9.0.1-full_build-shared.7z`](https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.1-full_build-shared.7z)
    from gyan.dev (LGPL) and extract it somewhere, e.g.
    `C:\dev\ffmpeg`. The extracted folder must contain `include\`, `lib\` and
    `bin\`. Pin this exact version — the bundled DLL names are
@@ -274,7 +300,7 @@ Then set the environment variables and build (PowerShell). Adjust the paths to
 where you extracted each archive:
 
 ```powershell
-$env:FFMPEG_DIR   = "C:\dev\ffmpeg\ffmpeg-8.1.1-full_build-shared"
+$env:FFMPEG_DIR   = "C:\dev\ffmpeg\ffmpeg-9.0.1-full_build-shared"
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
 $env:LIB          = "C:\dev\SDL2\SDL2-2.32.4\lib\x64;$env:LIB"
 

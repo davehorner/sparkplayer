@@ -54,6 +54,35 @@ impl CoreKeyEvent {
     }
 }
 
+/// Platform-neutral mouse event fed to [`crate::app::App::handle_mouse`]. Like
+/// [`CoreKeyEvent`], the native crate maps crossterm `MouseEvent`s into this so
+/// the hit-testing logic stays backend-free. `col`/`row` are terminal cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreMouseKind {
+    /// Left button pressed.
+    Down,
+    /// Left button held and moved (used for scrubbing the progress bar).
+    Drag,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoreMouseEvent {
+    pub kind: CoreMouseKind,
+    pub col: u16,
+    pub row: u16,
+}
+
+/// A gaplessly queued track that has just taken over the output, reported by
+/// [`AudioBackend::take_started_track`]. Carries the duration hint the backend
+/// learned while opening it, so the UI can fill in the progress bar without
+/// re-reading the file.
+#[derive(Debug, Clone, Default)]
+pub struct StartedTrack {
+    pub duration: Option<Duration>,
+}
+
 /// Audio playback + the visualizer sample tap. Native wraps rodio; web wraps a
 /// Web Audio graph fed from an `HTMLMediaElement`.
 pub trait AudioBackend {
@@ -102,6 +131,38 @@ pub trait AudioBackend {
     /// state. No-op for an invalid index or a backend without track support.
     fn set_audio_track(&mut self, _idx: usize) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    // --- Gapless playback -------------------------------------------------
+    //
+    // The four methods below let the app hand the *next* track to the backend
+    // before the current one ends, so playback crosses the seam without the
+    // silence that opening a file and spinning up a decoder would cost. A
+    // backend that can't do this keeps the defaults and the app falls back to
+    // the stop-and-play path driven by [`is_finished`](Self::is_finished).
+
+    /// Queue `source` to begin the instant the current track ends. Returns
+    /// `false` when the backend declines (unsupported, or a source it will only
+    /// play through the normal path).
+    fn preload_next(&mut self, _source: &TrackRef) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// Whether a queued track is still waiting behind the playing one. Goes
+    /// false once it starts, and whenever the backend drops the queue (a seek
+    /// or a manual track change rebuilds the playback chain).
+    fn has_preload(&self) -> bool {
+        false
+    }
+
+    /// Discard the queued track, if any. The playing one is untouched.
+    fn clear_preload(&mut self) {}
+
+    /// Take the "the queued track has started" edge, exactly once per
+    /// handover. `Some` means the sound the user hears is already the next
+    /// track and the UI should catch up.
+    fn take_started_track(&mut self) -> Option<StartedTrack> {
+        None
     }
 }
 
@@ -187,4 +248,14 @@ pub trait AlbumArtRenderer {
     fn has_art(&self) -> bool;
     /// Draw the art into `area` (native) or reposition the `<img>` overlay (web).
     fn render(&mut self, frame: &mut Frame, area: Rect);
+    /// Whether the backend can paint true pixel graphics (sixel/kitty/iterm),
+    /// as opposed to only colored cells. Gates the graphics waterfall
+    /// visualizer, which falls back to a cell renderer when this is false.
+    fn graphics_available(&self) -> bool {
+        false
+    }
+    /// Render a row-major RGB8 image (`w`×`h`) stretched to fill `area` via the
+    /// terminal graphics protocol. No-op on backends without pixel graphics.
+    fn render_rgb_frame(&mut self, _frame: &mut Frame, _area: Rect, _rgb: &[u8], _w: u32, _h: u32) {
+    }
 }

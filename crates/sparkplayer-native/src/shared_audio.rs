@@ -3,8 +3,8 @@
 //! The bridge is deliberately best-effort: callers should disable it if
 //! `open` fails rather than making player startup depend on an external
 //! consumer. Samples are published as interleaved stereo frames into a fixed
-//! ring buffer. Readers should use `generation` as a seqlock-style guard:
-//! read it before and after copying header/data and retry if it changed.
+//! ring buffer. `write_frame` is the release/acquire publication cursor;
+//! `generation` only guards stream and format transitions.
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -16,6 +16,8 @@ const MAGIC: u32 = u32::from_le_bytes(*b"SPRK");
 const VERSION: u32 = 1;
 const OUTPUT_CHANNELS: u32 = 2;
 const DEFAULT_CAPACITY_FRAMES: u32 = 48_000 * 10;
+
+const _: () = assert!(size_of::<SparkAudioHeader>() == 80);
 
 pub struct SharedAudioControl {
     pub playback: Option<bool>,
@@ -34,7 +36,11 @@ struct SparkAudioHeader {
     total_frames: u64,
     generation: u64,
     active: u32,
-    reserved: [u32; 7],
+    transport_sequence: u32,
+    transport_state: u32,
+    visualizer_sequence: u32,
+    visualizer_delta: i32,
+    reserved: [u32; 3],
 }
 
 /// Per-source channel assembler. This stays owned by the playback source so the
@@ -78,8 +84,7 @@ struct SharedAudioInner {
     _mapping: PlatformMapping,
     view: NonNull<u8>,
     capacity_frames: usize,
-    sample_rate: AtomicU32,
-    write_frame: AtomicU64,
+    next_frame: AtomicU64,
     generation: AtomicU64,
     last_transport_control: AtomicU32,
     last_visualizer_control: AtomicU32,
@@ -96,9 +101,8 @@ impl SharedAudioWriter {
             _mapping: mapping,
             view,
             capacity_frames,
-            sample_rate: AtomicU32::new(44_100),
-            write_frame: AtomicU64::new(0),
-            generation: AtomicU64::new(1),
+            next_frame: AtomicU64::new(0),
+            generation: AtomicU64::new(2),
             last_transport_control: AtomicU32::new(0),
             last_visualizer_control: AtomicU32::new(0),
         };
@@ -108,19 +112,18 @@ impl SharedAudioWriter {
         }
     }
 
-    pub fn set_format(&self, _channels: u16, sample_rate: u32) {
-        let sample_rate = sample_rate.max(1);
-        if self.inner.sample_rate.swap(sample_rate, Ordering::Release) != sample_rate {
-            self.reset();
-        }
+    /// Start a new stream epoch. Called by `TapSource` on the playback thread
+    /// when its first sample actually reaches the output.
+    pub fn begin_stream(&self, sample_rate: u32) {
+        self.inner.begin_stream(sample_rate.max(1));
     }
 
     pub fn push_frame(&self, left: f32, right: f32) {
         self.inner.push_frame(left, right);
     }
 
-    pub fn reset(&self) {
-        self.inner.reset();
+    pub fn end_stream(&self) {
+        self.inner.end_stream();
     }
 
     pub fn poll_control(&self) -> SharedAudioControl {
@@ -142,78 +145,112 @@ impl SharedAudioInner {
         }
     }
 
-    fn initialize_header(&self) {
-        unsafe {
-            std::ptr::write(
-                self.header(),
-                SparkAudioHeader {
-                    magic: MAGIC,
-                    version: VERSION,
-                    header_size: size_of::<SparkAudioHeader>() as u32,
-                    capacity_frames: self.capacity_frames as u32,
-                    channels: OUTPUT_CHANNELS,
-                    sample_rate: self.sample_rate.load(Ordering::Acquire),
-                    write_frame: 0,
-                    total_frames: 0,
-                    generation: self.generation.load(Ordering::Acquire),
-                    active: 1,
-                    reserved: [0; 7],
-                },
-            );
-        }
-        self.clear_audio();
+    fn header_u32(&self, field: *mut u32) -> &AtomicU32 {
+        // Header fields are naturally aligned and exclusively accessed with
+        // matching-width atomics once the mapping has been initialized.
+        unsafe { &*field.cast::<AtomicU32>() }
     }
 
-    fn reset(&self) {
+    fn header_u64(&self, field: *mut u64) -> &AtomicU64 {
+        unsafe { &*field.cast::<AtomicU64>() }
+    }
+
+    fn initialize_header(&self) {
+        let header = self.header();
+        let magic = self.header_u32(unsafe { std::ptr::addr_of_mut!((*header).magic) });
+        let generation = self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).generation) });
+        let previous_generation = if magic.load(Ordering::Acquire) == MAGIC {
+            generation.load(Ordering::Acquire) & !1
+        } else {
+            0
+        };
+        let next_generation = previous_generation.wrapping_add(2).max(2);
+        self.generation.store(next_generation, Ordering::Relaxed);
+
+        // Hide the header while replacing a stale writer's session. Publishing
+        // magic last prevents a reader from accepting a partially initialized
+        // header even when the named mapping survived the previous process.
+        magic.store(0, Ordering::Release);
+        generation.store(next_generation.wrapping_sub(1), Ordering::Release);
+        unsafe {
+            std::ptr::addr_of_mut!((*header).version).write(VERSION);
+            std::ptr::addr_of_mut!((*header).header_size)
+                .write(size_of::<SparkAudioHeader>() as u32);
+            std::ptr::addr_of_mut!((*header).capacity_frames).write(self.capacity_frames as u32);
+            std::ptr::addr_of_mut!((*header).channels).write(OUTPUT_CHANNELS);
+            std::ptr::addr_of_mut!((*header).sample_rate).write(44_100);
+            std::ptr::addr_of_mut!((*header).write_frame).write(0);
+            std::ptr::addr_of_mut!((*header).total_frames).write(0);
+            std::ptr::addr_of_mut!((*header).active).write(0);
+            std::ptr::addr_of_mut!((*header).transport_sequence).write(0);
+            std::ptr::addr_of_mut!((*header).transport_state).write(0);
+            std::ptr::addr_of_mut!((*header).visualizer_sequence).write(0);
+            std::ptr::addr_of_mut!((*header).visualizer_delta).write(0);
+            std::ptr::addr_of_mut!((*header).reserved).write([0; 3]);
+        }
+        generation.store(next_generation, Ordering::Release);
+        magic.store(MAGIC, Ordering::Release);
+    }
+
+    fn begin_stream(&self, sample_rate: u32) {
         let next_generation = self
             .generation
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1);
-        self.write_frame.store(0, Ordering::Release);
-        self.clear_audio();
+            .fetch_add(2, Ordering::AcqRel)
+            .wrapping_add(2);
+        self.next_frame.store(0, Ordering::Relaxed);
         let header = self.header();
-        unsafe {
-            std::ptr::addr_of_mut!((*header).sample_rate)
-                .write_volatile(self.sample_rate.load(Ordering::Acquire));
-            std::ptr::addr_of_mut!((*header).write_frame).write_volatile(0);
-            std::ptr::addr_of_mut!((*header).total_frames).write_volatile(0);
-            std::ptr::addr_of_mut!((*header).generation).write_volatile(next_generation);
-            std::ptr::addr_of_mut!((*header).active).write_volatile(1);
-        }
+        let generation = self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).generation) });
+        generation.store(next_generation.wrapping_sub(1), Ordering::Release);
+        self.header_u32(unsafe { std::ptr::addr_of_mut!((*header).sample_rate) })
+            .store(sample_rate, Ordering::Relaxed);
+        self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).total_frames) })
+            .store(0, Ordering::Relaxed);
+        self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).write_frame) })
+            .store(0, Ordering::Release);
+        self.header_u32(unsafe { std::ptr::addr_of_mut!((*header).active) })
+            .store(1, Ordering::Relaxed);
+        generation.store(next_generation, Ordering::Release);
     }
 
-    fn clear_audio(&self) {
-        let sample_count = self.capacity_frames * OUTPUT_CHANNELS as usize;
-        unsafe {
-            std::ptr::write_bytes(self.sample_ptr(), 0, sample_count);
-        }
+    fn end_stream(&self) {
+        let header = self.header();
+        self.header_u32(unsafe { std::ptr::addr_of_mut!((*header).active) })
+            .store(0, Ordering::Release);
     }
 
     fn push_frame(&self, left: f32, right: f32) {
-        let frame = self.write_frame.fetch_add(1, Ordering::AcqRel);
+        let frame = self.next_frame.fetch_add(1, Ordering::Relaxed);
         let frame_index = (frame as usize) % self.capacity_frames;
         let sample_offset = frame_index * OUTPUT_CHANNELS as usize;
         unsafe {
             let sample_ptr = self.sample_ptr();
             sample_ptr.add(sample_offset).write(left);
             sample_ptr.add(sample_offset + 1).write(right);
-
-            let total = frame.wrapping_add(1);
-            let header = self.header();
-            std::ptr::addr_of_mut!((*header).write_frame).write_volatile(total);
-            std::ptr::addr_of_mut!((*header).total_frames).write_volatile(total);
         }
+        let total = frame.wrapping_add(1);
+        let header = self.header();
+        self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).total_frames) })
+            .store(total, Ordering::Relaxed);
+        // Publishing the cursor last makes both samples visible to an
+        // acquire-loading reader on weakly ordered CPUs such as ARM.
+        self.header_u64(unsafe { std::ptr::addr_of_mut!((*header).write_frame) })
+            .store(total, Ordering::Release);
     }
 
     fn poll_control(&self) -> SharedAudioControl {
         let header = self.header();
-        let transport_generation =
-            unsafe { std::ptr::addr_of!((*header).reserved[0]).read_volatile() };
-        let transport_state = unsafe { std::ptr::addr_of!((*header).reserved[1]).read_volatile() };
-        let visualizer_generation =
-            unsafe { std::ptr::addr_of!((*header).reserved[2]).read_volatile() };
-        let visualizer_delta =
-            unsafe { std::ptr::addr_of!((*header).reserved[3]).read_volatile() as i32 };
+        let transport_generation = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).transport_sequence) })
+            .load(Ordering::Acquire);
+        let transport_state = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).transport_state) })
+            .load(Ordering::Relaxed);
+        let visualizer_generation = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).visualizer_sequence) })
+            .load(Ordering::Acquire);
+        let visualizer_delta = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).visualizer_delta).cast::<u32>() })
+            .load(Ordering::Relaxed) as i32;
 
         let playback = if transport_generation
             != self
@@ -248,10 +285,7 @@ impl SharedAudioInner {
 
 impl Drop for SharedAudioInner {
     fn drop(&mut self) {
-        let header = self.header();
-        unsafe {
-            std::ptr::addr_of_mut!((*header).active).write_volatile(0);
-        }
+        self.end_stream();
     }
 }
 
@@ -280,6 +314,7 @@ impl PlatformMapping {
 #[cfg(windows)]
 struct PlatformMappingImp {
     mapping: windows_sys::Win32::Foundation::HANDLE,
+    writer_mutex: windows_sys::Win32::Foundation::HANDLE,
     view: NonNull<u8>,
 }
 
@@ -293,11 +328,25 @@ impl PlatformMappingImp {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
         };
+        use windows_sys::Win32::System::Threading::CreateMutexW;
 
         let byte_len = shared_byte_len();
         let mapping_name = normalize_windows_name(name);
         let mut wide = mapping_name.encode_utf16().collect::<Vec<_>>();
         wide.push(0);
+
+        let mut mutex_wide = format!("{mapping_name}.writer")
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        mutex_wide.push(0);
+        let writer_mutex = unsafe { CreateMutexW(ptr::null(), 1, mutex_wide.as_ptr()) };
+        if writer_mutex.is_null() {
+            anyhow::bail!("CreateMutexW failed for {mapping_name}");
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe { CloseHandle(writer_mutex) };
+            anyhow::bail!("shared audio stream {mapping_name} is already in use");
+        }
 
         let mapping = unsafe {
             CreateFileMappingW(
@@ -310,24 +359,25 @@ impl PlatformMappingImp {
             )
         };
         if mapping.is_null() {
+            unsafe { CloseHandle(writer_mutex) };
             anyhow::bail!("CreateFileMappingW failed for {name}");
-        }
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            unsafe {
-                CloseHandle(mapping);
-            }
-            anyhow::bail!("shared audio stream {mapping_name} is already in use");
         }
 
         let view_address = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, byte_len) };
         let view = NonNull::new(view_address.Value.cast::<u8>()).ok_or_else(|| {
             unsafe {
                 CloseHandle(mapping);
+                windows_sys::Win32::System::Threading::ReleaseMutex(writer_mutex);
+                CloseHandle(writer_mutex);
             }
             anyhow::anyhow!("MapViewOfFile failed for {name}")
         })?;
 
-        Ok(Self { mapping, view })
+        Ok(Self {
+            mapping,
+            writer_mutex,
+            view,
+        })
     }
 
     fn view(&self) -> NonNull<u8> {
@@ -340,12 +390,15 @@ impl Drop for PlatformMappingImp {
     fn drop(&mut self) {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
 
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
                 Value: self.view.as_ptr().cast(),
             });
             CloseHandle(self.mapping);
+            ReleaseMutex(self.writer_mutex);
+            CloseHandle(self.writer_mutex);
         }
     }
 }
@@ -395,7 +448,6 @@ fn normalize_windows_name(name: &str) -> String {
 #[cfg(unix)]
 struct PlatformMappingImp {
     fd: i32,
-    name: std::ffi::CString,
     view: NonNull<u8>,
     byte_len: usize,
 }
@@ -406,30 +458,33 @@ impl PlatformMappingImp {
         use std::ptr;
 
         use libc::{
-            EEXIST, MAP_FAILED, MAP_SHARED, O_CREAT, O_EXCL, O_RDWR, PROT_READ, PROT_WRITE, c_void,
-            close, ftruncate, mmap, munmap, shm_open, shm_unlink,
+            LOCK_EX, LOCK_NB, MAP_FAILED, MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE,
+            c_void, close, flock, ftruncate, mmap, munmap, shm_open,
         };
 
         let name = normalize_posix_name(name)?;
         let byte_len = shared_byte_len();
-        let fd = unsafe { shm_open(name.as_ptr(), O_CREAT | O_EXCL | O_RDWR, 0o600) };
+        let fd = unsafe { shm_open(name.as_ptr(), O_CREAT | O_RDWR, 0o600) };
         if fd < 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(EEXIST) {
-                anyhow::bail!(
-                    "shared audio stream {} is already in use",
-                    name.to_string_lossy()
-                );
-            }
             anyhow::bail!("shm_open failed for {}: {error}", name.to_string_lossy());
+        }
+
+        // The lock belongs to the open file description and is released by
+        // the kernel on normal exit, process::exit, or a crash. The named
+        // segment itself may persist safely for consumers and later launches.
+        if unsafe { flock(fd, LOCK_EX | LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { close(fd) };
+            anyhow::bail!(
+                "shared audio stream {} is already in use: {error}",
+                name.to_string_lossy()
+            );
         }
 
         if unsafe { ftruncate(fd, byte_len as libc::off_t) } != 0 {
             let error = std::io::Error::last_os_error();
-            unsafe {
-                close(fd);
-                shm_unlink(name.as_ptr());
-            }
+            unsafe { close(fd) };
             anyhow::bail!("ftruncate failed for {}: {error}", name.to_string_lossy());
         }
 
@@ -445,20 +500,12 @@ impl PlatformMappingImp {
         };
         if view == MAP_FAILED {
             let error = std::io::Error::last_os_error();
-            unsafe {
-                close(fd);
-                shm_unlink(name.as_ptr());
-            }
+            unsafe { close(fd) };
             anyhow::bail!("mmap failed for {}: {error}", name.to_string_lossy());
         }
 
         let view = NonNull::new(view.cast::<u8>()).expect("mmap returned MAP_FAILED or non-null");
-        Ok(Self {
-            fd,
-            name,
-            view,
-            byte_len,
-        })
+        Ok(Self { fd, view, byte_len })
     }
 
     fn view(&self) -> NonNull<u8> {
@@ -469,12 +516,11 @@ impl PlatformMappingImp {
 #[cfg(unix)]
 impl Drop for PlatformMappingImp {
     fn drop(&mut self) {
-        use libc::{c_void, close, munmap, shm_unlink};
+        use libc::{c_void, close, munmap};
 
         unsafe {
             munmap(self.view.as_ptr().cast::<c_void>(), self.byte_len);
             close(self.fd);
-            shm_unlink(self.name.as_ptr());
         }
     }
 }
@@ -532,7 +578,22 @@ fn shared_byte_len() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedAudioFramePacker;
+    use std::sync::atomic::Ordering;
+
+    use super::{SharedAudioFramePacker, open};
+
+    fn test_name(label: &str) -> String {
+        format!("/sparkplayer_{label}_{}", std::process::id())
+    }
+
+    #[cfg(unix)]
+    fn remove_test_mapping(name: &str) {
+        let name = super::normalize_posix_name(name).unwrap();
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+    }
+
+    #[cfg(not(unix))]
+    fn remove_test_mapping(_name: &str) {}
 
     #[test]
     fn mono_samples_are_duplicated_to_stereo_frames() {
@@ -555,5 +616,42 @@ mod tests {
             assert_eq!(packer.push_sample(sample), None);
         }
         assert_eq!(packer.push_sample(0.6), Some((0.1, 0.2)));
+    }
+
+    #[test]
+    fn stream_epoch_does_not_clear_the_ring_and_publishes_complete_frames() {
+        let name = test_name("publication");
+        let writer = open(&name).unwrap();
+        let header = writer.inner.header();
+        unsafe { writer.inner.sample_ptr().write(123.0) };
+
+        writer.begin_stream(48_000);
+        let generation = writer
+            .inner
+            .header_u64(unsafe { std::ptr::addr_of_mut!((*header).generation) });
+        assert_eq!(generation.load(Ordering::Acquire) & 1, 0);
+        assert_eq!(unsafe { writer.inner.sample_ptr().read() }, 123.0);
+
+        writer.push_frame(0.25, -0.5);
+        let write_frame = writer
+            .inner
+            .header_u64(unsafe { std::ptr::addr_of_mut!((*header).write_frame) });
+        assert_eq!(write_frame.load(Ordering::Acquire), 1);
+        assert_eq!(unsafe { writer.inner.sample_ptr().read() }, 0.25);
+        assert_eq!(unsafe { writer.inner.sample_ptr().add(1).read() }, -0.5);
+
+        drop(writer);
+        remove_test_mapping(&name);
+    }
+
+    #[test]
+    fn writer_lock_survives_the_mapping_and_recovers_after_exit() {
+        let name = test_name("ownership");
+        let first = open(&name).unwrap();
+        assert!(open(&name).is_err());
+        drop(first);
+        let replacement = open(&name).unwrap();
+        drop(replacement);
+        remove_test_mapping(&name);
     }
 }

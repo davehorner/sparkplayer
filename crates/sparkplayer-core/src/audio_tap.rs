@@ -8,7 +8,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const TAP_CAPACITY: usize = 8192;
+// Holds enough interleaved samples for the largest FFT window (16384 mono
+// frames × 2 channels) the visualizer can be configured to use, so a stereo
+// window is never truncated.
+const TAP_CAPACITY: usize = 32768;
 
 #[derive(Clone, Default)]
 pub struct SampleBuffer {
@@ -92,6 +95,17 @@ impl SampleBuffer {
 
     pub fn set_base_offset(&self, offset: Duration) {
         if let Ok(mut g) = self.inner.lock() {
+            g.base_offset_secs = offset.as_secs_f64();
+        }
+    }
+
+    /// Restart position tracking at `offset` while keeping the waveform
+    /// history. Used at a gapless track boundary: the audio never stopped, so
+    /// wiping the ring the way [`reset`](Self::reset) does would punch a hole
+    /// of silence through the visualizers exactly where the seam is.
+    pub fn rebase(&self, offset: Duration) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.samples_consumed = 0;
             g.base_offset_secs = offset.as_secs_f64();
         }
     }

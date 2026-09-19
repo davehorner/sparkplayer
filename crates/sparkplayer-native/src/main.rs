@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -23,7 +26,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use sparkplayer_core::backend::{ConfigStore, CoreKey, CoreKeyEvent};
+use sparkplayer_core::backend::{
+    ConfigStore, CoreKey, CoreKeyEvent, CoreMouseEvent, CoreMouseKind,
+};
 use sparkplayer_core::library::Track;
 use sparkplayer_core::{App, ui};
 
@@ -89,7 +94,13 @@ struct Cli {
     subtitle_lang: Option<String>,
 
     /// Enable the Bespoke shared-memory audio bridge, optionally overriding the stream name.
-    #[arg(long, value_name = "NAME", default_missing_value = "/sparkplayer_audio", num_args = 0..=1)]
+    #[arg(
+        long,
+        value_name = "NAME",
+        default_missing_value = "/sparkplayer_audio",
+        num_args = 0..=1,
+        require_equals = true
+    )]
     bespoke_shm: Option<String>,
 }
 
@@ -153,21 +164,21 @@ fn main() -> Result<()> {
         (tracks, dir)
     };
 
+    let (shared_audio, shared_audio_warning) = match cli.bespoke_shm.as_deref() {
+        Some(name) => match shared_audio::open(name) {
+            Ok(shared) => (Some(shared), None),
+            Err(error) => (
+                None,
+                Some(format!("Bespoke shared-memory audio disabled: {error:#}")),
+            ),
+        },
+        None => (None, None),
+    };
+
     let mut terminal = setup_terminal().context("setting up terminal")?;
     // Picker queries the terminal — must happen after raw mode is enabled so
     // escape responses come through stdin without echoing as characters.
     let picker = build_picker(cli.graphics.into());
-
-    let shared_audio = cli
-        .bespoke_shm
-        .as_deref()
-        .and_then(|name| match shared_audio::open(name) {
-            Ok(shared) => Some(shared),
-            Err(error) => {
-                eprintln!("warning: Bespoke shared-memory audio disabled: {error:#}");
-                None
-            }
-        });
     let shared_audio_control = shared_audio.clone();
     let audio = AudioPlayer::new(shared_audio)?;
     let video = NativeVideoBackend::new(picker.clone());
@@ -183,7 +194,11 @@ fn main() -> Result<()> {
         initial_dir,
         &cfg,
     );
+    if let Some(warning) = shared_audio_warning {
+        app.status = warning;
+    }
     app.preferred_subtitle_lang = cli.subtitle_lang.clone();
+    app.truecolor = terminal_is_truecolor();
     if cli.video_window {
         app.video.set_external_window(true);
     }
@@ -296,7 +311,7 @@ fn apply_shared_audio_control(shared: &SharedAudioWriter, app: &mut App) -> Resu
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -304,9 +319,48 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Whether the terminal can render 24-bit color (gates the spectrogram's
+/// half-block resolution boost). Trusts the de-facto `COLORTERM=truecolor`/
+/// `24bit` signal when present; otherwise — since the whole UI palette is
+/// already 24-bit — assumes truecolor unless `TERM` names a genuinely
+/// low-color display (the Linux VT console or a dumb/unset terminal).
+fn terminal_is_truecolor() -> bool {
+    if let Ok(ct) = std::env::var("COLORTERM") {
+        let ct = ct.to_ascii_lowercase();
+        if ct.contains("truecolor") || ct.contains("24bit") {
+            return true;
+        }
+    }
+    !matches!(
+        std::env::var("TERM").ok().as_deref(),
+        Some("linux") | Some("dumb") | Some("") | None
+    )
+}
+
+/// Translate a crossterm mouse event into the platform-neutral core event. Only
+/// left-button press/drag and the scroll wheel drive UI; other kinds are None.
+fn map_mouse(me: MouseEvent) -> Option<CoreMouseEvent> {
+    let kind = match me.kind {
+        MouseEventKind::Down(MouseButton::Left) => CoreMouseKind::Down,
+        MouseEventKind::Drag(MouseButton::Left) => CoreMouseKind::Drag,
+        MouseEventKind::ScrollUp => CoreMouseKind::ScrollUp,
+        MouseEventKind::ScrollDown => CoreMouseKind::ScrollDown,
+        _ => return None,
+    };
+    Some(CoreMouseEvent {
+        kind,
+        col: me.column,
+        row: me.row,
+    })
 }
 
 fn run_loop(
@@ -316,13 +370,23 @@ fn run_loop(
     mut media: Option<&mut MediaOs>,
     shared_audio: Option<SharedAudioWriter>,
 ) -> Result<()> {
-    let frame_dur = Duration::from_millis(33);
+    // Redraw at ~60 fps for smooth visualizers; run the heavier video/advance
+    // tick at ~30 fps. Crucially the event-poll timeout below is driven by the
+    // *draw* deadline, so idle frames are evenly spaced regardless of input —
+    // otherwise the redraw gate fires out of phase with the wake schedule and
+    // only looks smooth while a stream of mouse events keeps the loop spinning.
+    let draw_dur = Duration::from_millis(16);
+    let tick_dur = Duration::from_millis(33);
     let start = Instant::now();
     let mut last_tick = Instant::now();
+    let mut last_draw = Instant::now();
 
     loop {
         app.set_clock(start.elapsed().as_secs_f64());
-        terminal.draw(|f| ui::draw(f, app))?;
+        if last_draw.elapsed() >= draw_dur {
+            terminal.draw(|f| ui::draw(f, app))?;
+            last_draw = Instant::now();
+        }
 
         // Adopt the library index once the background scan reports in.
         if let Ok(tracks) = index_rx.try_recv() {
@@ -340,13 +404,29 @@ fn run_loop(
             }
         }
 
-        let timeout = frame_dur
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_default();
+        // Wake in time for whichever comes first — the next redraw or tick.
+        let timeout = draw_dur
+            .saturating_sub(last_draw.elapsed())
+            .min(tick_dur.saturating_sub(last_tick.elapsed()));
         if event::poll(timeout)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Release {
-                    app.handle_key(map_key(key.code, key.modifiers))?;
+            // Drain everything queued this wake so an input burst is handled in
+            // one pass instead of one event per (rate-limited) redraw.
+            loop {
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind != KeyEventKind::Release {
+                            app.handle_key(map_key(key.code, key.modifiers))?;
+                        }
+                    }
+                    Event::Mouse(me) => {
+                        if let Some(m) = map_mouse(me) {
+                            app.handle_mouse(m)?;
+                        }
+                    }
+                    _ => {}
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
                 }
             }
         }
@@ -356,7 +436,7 @@ fn run_loop(
             app.handle_key(ev)?;
         }
 
-        if last_tick.elapsed() >= frame_dur {
+        if last_tick.elapsed() >= tick_dur {
             app.check_advance()?;
             app.tick_video();
             last_tick = Instant::now();
@@ -372,4 +452,24 @@ fn run_loop(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn bare_bespoke_flag_does_not_consume_the_media_path() {
+        let cli = Cli::try_parse_from(["sparkplayer", "--bespoke-shm", "C:\\Music"]).unwrap();
+        assert_eq!(cli.bespoke_shm.as_deref(), Some("/sparkplayer_audio"));
+        assert_eq!(cli.path, Some(PathBuf::from("C:\\Music")));
+    }
+
+    #[test]
+    fn bespoke_stream_override_requires_and_accepts_equals() {
+        let cli = Cli::try_parse_from(["sparkplayer", "--bespoke-shm=custom"]).unwrap();
+        assert_eq!(cli.bespoke_shm.as_deref(), Some("custom"));
+    }
 }

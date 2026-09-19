@@ -10,12 +10,19 @@ pub struct Config {
     pub theme: String,
     pub volume: f32,
     pub visualizer: String,
+    /// FFT window size for the spectrum visualizers (power of two).
+    pub fft_size: usize,
+    /// Scroll speed (rows/columns per second) for the scrolling FFT views.
+    pub scroll_speed: u32,
 
     /// Last browser directory (native). Empty/None on first run or web.
     pub last_dir: Option<String>,
     /// Repeat mode as a lowercase string: "off" | "all" | "one".
     pub repeat: String,
     pub shuffle: bool,
+    /// Whether to hand the next track to the audio backend early so playback
+    /// crosses the seam without a gap.
+    pub gapless: bool,
     /// The playlist as file paths, in order (native; object-URL playlists on
     /// web are ephemeral and not persisted).
     pub playlist: Vec<String>,
@@ -41,9 +48,12 @@ impl Default for Config {
             theme: "default".to_string(),
             volume: 0.8,
             visualizer: "spectrum".to_string(),
+            fft_size: crate::visualizer::FFT_DEFAULT_SIZE,
+            scroll_speed: crate::visualizer::SCROLL_SPEED_DEFAULT,
             last_dir: None,
             repeat: "off".to_string(),
             shuffle: false,
+            gapless: true,
             playlist: Vec::new(),
             playing_index: None,
             position_secs: 0.0,
@@ -78,6 +88,16 @@ impl Config {
                     }
                 }
                 "visualizer" => cfg.visualizer = val.to_string(),
+                "fft_size" => {
+                    if let Ok(v) = val.parse::<usize>() {
+                        cfg.fft_size = crate::visualizer::clamp_fft_size(v);
+                    }
+                }
+                "scroll_speed" => {
+                    if let Ok(v) = val.parse::<u32>() {
+                        cfg.scroll_speed = crate::visualizer::clamp_scroll_speed(v);
+                    }
+                }
                 "last_dir" if !val.is_empty() => cfg.last_dir = Some(val.to_string()),
                 "repeat" => {
                     let v = val.to_ascii_lowercase();
@@ -86,6 +106,7 @@ impl Config {
                     }
                 }
                 "shuffle" => cfg.shuffle = matches!(val, "true" | "1" | "on"),
+                "gapless" => cfg.gapless = matches!(val, "true" | "1" | "on"),
                 "playing_index" => cfg.playing_index = val.parse::<usize>().ok(),
                 "position_secs" => {
                     if let Ok(v) = val.parse::<f64>() {
@@ -124,8 +145,11 @@ impl Config {
         out.push_str(&format!("theme = \"{}\"\n", self.theme));
         out.push_str(&format!("volume = {}\n", self.volume));
         out.push_str(&format!("visualizer = \"{}\"\n", self.visualizer));
+        out.push_str(&format!("fft_size = {}\n", self.fft_size));
+        out.push_str(&format!("scroll_speed = {}\n", self.scroll_speed));
         out.push_str(&format!("repeat = \"{}\"\n", self.repeat));
         out.push_str(&format!("shuffle = {}\n", self.shuffle));
+        out.push_str(&format!("gapless = {}\n", self.gapless));
         if let Some(dir) = &self.last_dir {
             out.push_str(&format!("last_dir = \"{}\"\n", dir));
         }
@@ -159,9 +183,12 @@ mod tests {
             theme: "dracula".to_string(),
             volume: 0.65,
             visualizer: "waveform".to_string(),
+            fft_size: 4096,
+            scroll_speed: 45,
             last_dir: Some("/home/me/Music".to_string()),
             repeat: "all".to_string(),
             shuffle: true,
+            gapless: false,
             playlist: vec![
                 "/home/me/Music/a.flac".to_string(),
                 "/home/me/Music/b.mp3".to_string(),
@@ -188,6 +215,7 @@ mod tests {
         assert_eq!(cfg.theme, "nord");
         assert_eq!(cfg.repeat, "off");
         assert!(!cfg.shuffle);
+        assert!(cfg.gapless);
         assert!(cfg.playlist.is_empty());
         assert_eq!(cfg.playing_index, None);
     }
