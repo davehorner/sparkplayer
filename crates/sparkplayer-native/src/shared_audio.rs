@@ -13,14 +13,17 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use anyhow::{Context, Result};
 
 const MAGIC: u32 = u32::from_le_bytes(*b"SPRK");
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const OUTPUT_CHANNELS: u32 = 2;
 const DEFAULT_CAPACITY_FRAMES: u32 = 48_000 * 10;
 
-const _: () = assert!(size_of::<SparkAudioHeader>() == 80);
+const METADATA_LEN: usize = 128;
+const _: () = assert!(size_of::<SparkAudioHeader>() == 600);
 
 pub struct SharedAudioControl {
     pub playback: Option<bool>,
+    pub next_track: bool,
+    pub previous_track: bool,
     pub visualizer_delta: i32,
 }
 
@@ -40,7 +43,14 @@ struct SparkAudioHeader {
     transport_state: u32,
     visualizer_sequence: u32,
     visualizer_delta: i32,
-    reserved: [u32; 3],
+    track_sequence: u32,
+    track_action: u32,
+    reserved: u32,
+    metadata_sequence: u32,
+    title: [u8; METADATA_LEN],
+    artist: [u8; METADATA_LEN],
+    album: [u8; METADATA_LEN],
+    info: [u8; METADATA_LEN],
 }
 
 /// Per-source channel assembler. This stays owned by the playback source so the
@@ -88,6 +98,7 @@ struct SharedAudioInner {
     generation: AtomicU64,
     last_transport_control: AtomicU32,
     last_visualizer_control: AtomicU32,
+    last_track_control: AtomicU32,
 }
 
 unsafe impl Send for SharedAudioInner {}
@@ -105,6 +116,7 @@ impl SharedAudioWriter {
             generation: AtomicU64::new(2),
             last_transport_control: AtomicU32::new(0),
             last_visualizer_control: AtomicU32::new(0),
+            last_track_control: AtomicU32::new(0),
         };
         inner.initialize_header();
         Self {
@@ -128,6 +140,10 @@ impl SharedAudioWriter {
 
     pub fn poll_control(&self) -> SharedAudioControl {
         self.inner.poll_control()
+    }
+
+    pub fn publish_metadata(&self, title: &str, artist: &str, album: &str, info: &str) {
+        self.inner.publish_metadata(title, artist, album, info);
     }
 }
 
@@ -186,7 +202,14 @@ impl SharedAudioInner {
             std::ptr::addr_of_mut!((*header).transport_state).write(0);
             std::ptr::addr_of_mut!((*header).visualizer_sequence).write(0);
             std::ptr::addr_of_mut!((*header).visualizer_delta).write(0);
-            std::ptr::addr_of_mut!((*header).reserved).write([0; 3]);
+            std::ptr::addr_of_mut!((*header).track_sequence).write(0);
+            std::ptr::addr_of_mut!((*header).track_action).write(0);
+            std::ptr::addr_of_mut!((*header).reserved).write(0);
+            std::ptr::addr_of_mut!((*header).metadata_sequence).write(0);
+            std::ptr::addr_of_mut!((*header).title).write([0; METADATA_LEN]);
+            std::ptr::addr_of_mut!((*header).artist).write([0; METADATA_LEN]);
+            std::ptr::addr_of_mut!((*header).album).write([0; METADATA_LEN]);
+            std::ptr::addr_of_mut!((*header).info).write([0; METADATA_LEN]);
         }
         generation.store(next_generation, Ordering::Release);
         magic.store(MAGIC, Ordering::Release);
@@ -251,6 +274,12 @@ impl SharedAudioInner {
         let visualizer_delta = self
             .header_u32(unsafe { std::ptr::addr_of_mut!((*header).visualizer_delta).cast::<u32>() })
             .load(Ordering::Relaxed) as i32;
+        let track_sequence = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).track_sequence) })
+            .load(Ordering::Acquire);
+        let track_action = self
+            .header_u32(unsafe { std::ptr::addr_of_mut!((*header).track_action) })
+            .load(Ordering::Relaxed);
 
         let playback = if transport_generation
             != self
@@ -275,12 +304,41 @@ impl SharedAudioInner {
         } else {
             0
         };
+        let track_changed = track_sequence
+            != self
+                .last_track_control
+                .swap(track_sequence, Ordering::AcqRel);
 
         SharedAudioControl {
             playback,
+            next_track: track_changed && track_action == 1,
+            previous_track: track_changed && track_action == 2,
             visualizer_delta: delta,
         }
     }
+
+    fn publish_metadata(&self, title: &str, artist: &str, album: &str, info: &str) {
+        let header = self.header();
+        let sequence =
+            self.header_u32(unsafe { std::ptr::addr_of_mut!((*header).metadata_sequence) });
+        let next = sequence.load(Ordering::Relaxed).wrapping_add(2) & !1;
+        sequence.store(next.wrapping_sub(1), Ordering::Release);
+        unsafe {
+            write_text(std::ptr::addr_of_mut!((*header).title), title);
+            write_text(std::ptr::addr_of_mut!((*header).artist), artist);
+            write_text(std::ptr::addr_of_mut!((*header).album), album);
+            write_text(std::ptr::addr_of_mut!((*header).info), info);
+        }
+        sequence.store(next, Ordering::Release);
+    }
+}
+
+unsafe fn write_text(destination: *mut [u8; METADATA_LEN], value: &str) {
+    let output = unsafe { &mut *destination };
+    output.fill(0);
+    let bytes = value.as_bytes();
+    let count = bytes.len().min(METADATA_LEN - 1);
+    output[..count].copy_from_slice(&bytes[..count]);
 }
 
 impl Drop for SharedAudioInner {

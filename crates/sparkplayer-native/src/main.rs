@@ -295,6 +295,12 @@ fn apply_shared_audio_control(shared: &SharedAudioWriter, app: &mut App) -> Resu
             app.audio.toggle_pause();
         }
     }
+    if control.next_track {
+        app.next_track()?;
+    }
+    if control.previous_track {
+        app.prev_track()?;
+    }
 
     if control.visualizer_delta > 0 {
         for _ in 0..control.visualizer_delta {
@@ -394,6 +400,35 @@ fn run_loop(
         }
 
         if let Some(shared) = shared_audio.as_ref() {
+            let meta = &app.current_meta;
+            let title = meta
+                .title
+                .clone()
+                .or_else(|| {
+                    app.playing_index
+                        .and_then(|index| app.tracks.get(index))
+                        .map(|track| track.display.clone())
+                })
+                .unwrap_or_default();
+            let mut info = Vec::new();
+            if let Some(rate) = meta.sample_rate {
+                info.push(format!("{rate} Hz"));
+            }
+            if let Some(channels) = meta.channels {
+                info.push(format!("{channels} ch"));
+            }
+            if let Some(bitrate) = meta.bitrate {
+                info.push(format!("{bitrate} kbps"));
+            }
+            if let Some(year) = meta.year {
+                info.push(year.to_string());
+            }
+            shared.publish_metadata(
+                &title,
+                meta.artist.as_deref().unwrap_or(""),
+                meta.album.as_deref().unwrap_or(""),
+                &info.join("  |  "),
+            );
             apply_shared_audio_control(shared, app)?;
         }
 

@@ -151,7 +151,7 @@ systems and `Local\SparkPlayerAudio` on Windows. Only one SparkPlayer process
 may own a given name at a time; a second process using the same name disables
 its bridge instead of replacing or clearing the existing stream.
 
-The shared header starts with magic `SPRK`, version `1`, fixed stereo output,
+The shared header starts with magic `SPRK`, version `2`, fixed stereo output,
 `sample_rate`, `write_frame`, `total_frames`, and `generation`. Audio frames are
 published by a release store to `write_frame`; consumers must load it with
 acquire semantics before reading the corresponding stereo `f32` frames.
@@ -164,6 +164,9 @@ writes `transport_state` (`1` = play, `2` = pause) and then release-stores a new
 `transport_sequence`. Visualizer changes use `visualizer_delta` followed by a
 release store to `visualizer_sequence`. SparkPlayer acquire-loads each sequence
 and applies a command once whenever it changes.
+Track navigation uses `track_action` (`1` = next, `2` = previous) followed by
+`track_sequence`. Title, artist, album, and format information are published as
+fixed UTF-8 fields guarded by the even/odd `metadata_sequence`.
 
 Writer ownership is held by an OS lock rather than by the lifetime of the
 mapping. This allows Unix mappings to survive a crash or SparkPlayer's direct
