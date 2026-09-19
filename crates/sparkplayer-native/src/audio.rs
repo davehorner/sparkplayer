@@ -312,6 +312,7 @@ struct TapSource<S> {
     tap: SampleBuffer,
     shared_audio: Option<SharedAudioWriter>,
     shared_audio_packer: Option<SharedAudioFramePacker>,
+    shared_stream_sample_rate: Option<u32>,
     /// `Some` only for a source queued behind another, until the moment it
     /// starts playing. A source that plays immediately configures the tap up
     /// front and leaves this `None`.
@@ -334,11 +335,8 @@ where
             tap,
             shared_audio,
             shared_audio_packer,
-            takeover: Some(Takeover {
-                channels,
-                sample_rate,
-                handover: Arc::new(Handover::default()),
-            }),
+            shared_stream_sample_rate: Some(sample_rate),
+            takeover: None,
         }
     }
 
@@ -364,6 +362,7 @@ where
             tap,
             shared_audio,
             shared_audio_packer,
+            shared_stream_sample_rate: Some(takeover.sample_rate),
             takeover: Some(takeover),
         }
     }
@@ -388,19 +387,20 @@ where
             // visualizers flow through the seam.
             self.tap.set_format(t.channels, t.sample_rate);
             self.tap.rebase(Duration::ZERO);
-            if let Some(shared) = self.shared_audio.as_ref() {
-                shared.begin_stream(t.sample_rate);
-            }
             t.handover.started.store(true, Ordering::Release);
+        }
+        if let Some(sample_rate) = self.shared_stream_sample_rate.take()
+            && let Some(shared) = self.shared_audio.as_ref()
+        {
+            shared.begin_stream(sample_rate);
         }
         self.tap.push(v);
         if let (Some(shared), Some(packer)) = (
             self.shared_audio.as_ref(),
             self.shared_audio_packer.as_mut(),
-        ) {
-            if let Some((left, right)) = packer.push_sample(v) {
-                shared.push_frame(left, right);
-            }
+        ) && let Some((left, right)) = packer.push_sample(v)
+        {
+            shared.push_frame(left, right);
         }
         Some(v)
     }
@@ -962,10 +962,13 @@ mod tests {
     #[test]
     fn immediately_playing_source_configures_the_tap_up_front() {
         let tap = tap_mid_track();
+        tap.reset();
+        tap.set_base_offset(Duration::from_secs(60));
         let mut source = TapSource::new(queued_buffer(), tap.clone(), None);
         // No handover to wait for — this one is the track being started.
         assert_eq!(tap.sample_rate(), 8_000);
         assert_eq!(source.next(), Some(0.25));
+        assert!(tap.position() >= Duration::from_secs(60));
     }
 
     /// Write a mono 16-bit PCM WAV holding a constant `value` — a flat signal

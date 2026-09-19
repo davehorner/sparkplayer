@@ -288,12 +288,10 @@ fn apply_media(cmd: MediaCommand, app: &mut App) -> Result<()> {
 
 fn apply_shared_audio_control(shared: &SharedAudioWriter, app: &mut App) -> Result<()> {
     let control = shared.poll_control();
-    if let Some(should_play) = control.playback {
-        if should_play && app.audio.is_paused() {
-            app.audio.toggle_pause();
-        } else if !should_play && !app.audio.is_paused() {
-            app.audio.toggle_pause();
-        }
+    if let Some(should_play) = control.playback
+        && should_play == app.audio.is_paused()
+    {
+        app.audio.toggle_pause();
     }
     if control.next_track {
         app.next_track()?;
@@ -386,6 +384,7 @@ fn run_loop(
     let start = Instant::now();
     let mut last_tick = Instant::now();
     let mut last_draw = Instant::now();
+    let mut published_metadata_track: Option<Option<usize>> = None;
 
     loop {
         app.set_clock(start.elapsed().as_secs_f64());
@@ -400,35 +399,38 @@ fn run_loop(
         }
 
         if let Some(shared) = shared_audio.as_ref() {
-            let meta = &app.current_meta;
-            let title = meta
-                .title
-                .clone()
-                .or_else(|| {
-                    app.playing_index
-                        .and_then(|index| app.tracks.get(index))
-                        .map(|track| track.display.clone())
-                })
-                .unwrap_or_default();
-            let mut info = Vec::new();
-            if let Some(rate) = meta.sample_rate {
-                info.push(format!("{rate} Hz"));
+            if published_metadata_track != Some(app.playing_index) {
+                let meta = &app.current_meta;
+                let title = meta
+                    .title
+                    .clone()
+                    .or_else(|| {
+                        app.playing_index
+                            .and_then(|index| app.tracks.get(index))
+                            .map(|track| track.display.clone())
+                    })
+                    .unwrap_or_default();
+                let mut info = Vec::new();
+                if let Some(rate) = meta.sample_rate {
+                    info.push(format!("{rate} Hz"));
+                }
+                if let Some(channels) = meta.channels {
+                    info.push(format!("{channels} ch"));
+                }
+                if let Some(bitrate) = meta.bitrate {
+                    info.push(format!("{bitrate} kbps"));
+                }
+                if let Some(year) = meta.year {
+                    info.push(year.to_string());
+                }
+                shared.publish_metadata(
+                    &title,
+                    meta.artist.as_deref().unwrap_or(""),
+                    meta.album.as_deref().unwrap_or(""),
+                    &info.join("  |  "),
+                );
+                published_metadata_track = Some(app.playing_index);
             }
-            if let Some(channels) = meta.channels {
-                info.push(format!("{channels} ch"));
-            }
-            if let Some(bitrate) = meta.bitrate {
-                info.push(format!("{bitrate} kbps"));
-            }
-            if let Some(year) = meta.year {
-                info.push(year.to_string());
-            }
-            shared.publish_metadata(
-                &title,
-                meta.artist.as_deref().unwrap_or(""),
-                meta.album.as_deref().unwrap_or(""),
-                &info.join("  |  "),
-            );
             apply_shared_audio_control(shared, app)?;
         }
 
@@ -448,10 +450,8 @@ fn run_loop(
             // one pass instead of one event per (rate-limited) redraw.
             loop {
                 match event::read()? {
-                    Event::Key(key) => {
-                        if key.kind != KeyEventKind::Release {
-                            app.handle_key(map_key(key.code, key.modifiers))?;
-                        }
+                    Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        app.handle_key(map_key(key.code, key.modifiers))?;
                     }
                     Event::Mouse(me) => {
                         if let Some(m) = map_mouse(me) {

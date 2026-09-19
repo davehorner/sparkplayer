@@ -337,7 +337,10 @@ unsafe fn write_text(destination: *mut [u8; METADATA_LEN], value: &str) {
     let output = unsafe { &mut *destination };
     output.fill(0);
     let bytes = value.as_bytes();
-    let count = bytes.len().min(METADATA_LEN - 1);
+    let mut count = bytes.len().min(METADATA_LEN - 1);
+    while !value.is_char_boundary(count) {
+        count -= 1;
+    }
     output[..count].copy_from_slice(&bytes[..count]);
 }
 
@@ -506,6 +509,7 @@ fn normalize_windows_name(name: &str) -> String {
 #[cfg(unix)]
 struct PlatformMappingImp {
     fd: i32,
+    _writer_lock: std::fs::File,
     view: NonNull<u8>,
     byte_len: usize,
 }
@@ -513,31 +517,37 @@ struct PlatformMappingImp {
 #[cfg(unix)]
 impl PlatformMappingImp {
     fn open(name: &str) -> Result<Self> {
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
         use std::ptr;
 
         use libc::{
             LOCK_EX, LOCK_NB, MAP_FAILED, MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE,
-            c_void, close, flock, ftruncate, mmap, munmap, shm_open,
+            close, flock, ftruncate, mmap, shm_open,
         };
 
         let name = normalize_posix_name(name)?;
         let byte_len = shared_byte_len();
-        let fd = unsafe { shm_open(name.as_ptr(), O_CREAT | O_RDWR, 0o600) };
-        if fd < 0 {
+        let lock_name = name.to_string_lossy().trim_start_matches('/').to_string();
+        let lock_path = std::env::temp_dir().join(format!("sparkplayer-{lock_name}.lock"));
+        let writer_lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .with_context(|| format!("opening writer lock {}", lock_path.display()))?;
+        if unsafe { flock(writer_lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
             let error = std::io::Error::last_os_error();
-            anyhow::bail!("shm_open failed for {}: {error}", name.to_string_lossy());
-        }
-
-        // The lock belongs to the open file description and is released by
-        // the kernel on normal exit, process::exit, or a crash. The named
-        // segment itself may persist safely for consumers and later launches.
-        if unsafe { flock(fd, LOCK_EX | LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            unsafe { close(fd) };
             anyhow::bail!(
                 "shared audio stream {} is already in use: {error}",
                 name.to_string_lossy()
             );
+        }
+
+        let fd = unsafe { shm_open(name.as_ptr(), O_CREAT | O_RDWR, 0o600) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            anyhow::bail!("shm_open failed for {}: {error}", name.to_string_lossy());
         }
 
         if unsafe { ftruncate(fd, byte_len as libc::off_t) } != 0 {
@@ -563,7 +573,12 @@ impl PlatformMappingImp {
         }
 
         let view = NonNull::new(view.cast::<u8>()).expect("mmap returned MAP_FAILED or non-null");
-        Ok(Self { fd, view, byte_len })
+        Ok(Self {
+            fd,
+            _writer_lock: writer_lock,
+            view,
+            byte_len,
+        })
     }
 
     fn view(&self) -> NonNull<u8> {
@@ -638,7 +653,7 @@ fn shared_byte_len() -> usize {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{SharedAudioFramePacker, open};
+    use super::{METADATA_LEN, SharedAudioFramePacker, open, write_text};
 
     fn test_name(label: &str) -> String {
         format!("/sparkplayer_{label}_{}", std::process::id())
@@ -711,5 +726,15 @@ mod tests {
         let replacement = open(&name).unwrap();
         drop(replacement);
         remove_test_mapping(&name);
+    }
+
+    #[test]
+    fn metadata_truncation_preserves_utf8_boundaries() {
+        let mut output = [0; METADATA_LEN];
+        let value = format!("{}é", "a".repeat(126));
+        unsafe { write_text(&mut output, &value) };
+        let end = output.iter().position(|&byte| byte == 0).unwrap();
+        assert_eq!(end, 126);
+        assert!(std::str::from_utf8(&output[..end]).is_ok());
     }
 }
