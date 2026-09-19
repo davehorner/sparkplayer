@@ -18,7 +18,7 @@ use sparkplayer_core::backend::AudioBackend;
 use sparkplayer_core::library;
 use sparkplayer_core::{SampleBuffer, TrackRef};
 
-use crate::shared_audio::SharedAudioWriter;
+use crate::shared_audio::{SharedAudioFramePacker, SharedAudioWriter};
 
 /// Audio source backed by an ffmpeg input. Used when playing video files
 /// (and also as a generic fallback for audio formats rodio's symphonia layer
@@ -287,6 +287,7 @@ struct TapSource<S> {
     inner: S,
     tap: SampleBuffer,
     shared_audio: Option<SharedAudioWriter>,
+    shared_audio_packer: Option<SharedAudioFramePacker>,
 }
 
 impl<S> TapSource<S>
@@ -297,6 +298,9 @@ where
         let channels = inner.channels().get();
         let sample_rate = inner.sample_rate().get();
         tap.set_format(channels, sample_rate);
+        let shared_audio_packer = shared_audio
+            .as_ref()
+            .map(|_| SharedAudioFramePacker::new(channels));
         if let Some(shared) = shared_audio.as_ref() {
             shared.set_format(channels, sample_rate);
         }
@@ -304,6 +308,7 @@ where
             inner,
             tap,
             shared_audio,
+            shared_audio_packer,
         }
     }
 }
@@ -316,8 +321,13 @@ where
     fn next(&mut self) -> Option<f32> {
         let v = self.inner.next()?;
         self.tap.push(v);
-        if let Some(shared) = self.shared_audio.as_ref() {
-            shared.push_sample(v);
+        if let (Some(shared), Some(packer)) = (
+            self.shared_audio.as_ref(),
+            self.shared_audio_packer.as_mut(),
+        ) {
+            if let Some((left, right)) = packer.push_sample(v) {
+                shared.push_frame(left, right);
+            }
         }
         Some(v)
     }

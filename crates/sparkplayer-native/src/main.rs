@@ -88,9 +88,9 @@ struct Cli {
     #[arg(long, value_name = "LANG")]
     subtitle_lang: Option<String>,
 
-    /// Shared-memory stream name used to publish decoded audio for Bespoke.
-    #[arg(long, value_name = "NAME", default_value = "/sparkplayer_audio", default_missing_value = "/sparkplayer_audio", num_args = 0..=1)]
-    bespoke_shm: String,
+    /// Enable the Bespoke shared-memory audio bridge, optionally overriding the stream name.
+    #[arg(long, value_name = "NAME", default_missing_value = "/sparkplayer_audio", num_args = 0..=1)]
+    bespoke_shm: Option<String>,
 }
 
 /// Translate a crossterm key into the platform-neutral [`CoreKeyEvent`] the
@@ -158,9 +158,18 @@ fn main() -> Result<()> {
     // escape responses come through stdin without echoing as characters.
     let picker = build_picker(cli.graphics.into());
 
-    let shared_audio = shared_audio::open(&cli.bespoke_shm)?;
+    let shared_audio = cli
+        .bespoke_shm
+        .as_deref()
+        .and_then(|name| match shared_audio::open(name) {
+            Ok(shared) => Some(shared),
+            Err(error) => {
+                eprintln!("warning: Bespoke shared-memory audio disabled: {error:#}");
+                None
+            }
+        });
     let shared_audio_control = shared_audio.clone();
-    let audio = AudioPlayer::new(Some(shared_audio))?;
+    let audio = AudioPlayer::new(shared_audio)?;
     let video = NativeVideoBackend::new(picker.clone());
     let art = NativeAlbumArt::new(picker);
 
@@ -216,7 +225,7 @@ fn main() -> Result<()> {
         &mut app,
         idx_rx,
         media.as_mut(),
-        Some(shared_audio_control),
+        shared_audio_control,
     );
     restore_terminal(&mut terminal).ok();
     app.save_session();

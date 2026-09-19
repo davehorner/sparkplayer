@@ -118,11 +118,31 @@ the `Esc` menu, where ‹ › adjust the selection.
 --graphics <PROTOCOL>   Override the album-art graphics protocol.
                         One of: auto, halfblocks, sixel, kitty, iterm.
                         Default: auto.
+--bespoke-shm[=NAME]    Enable the shared-memory audio bridge for Bespoke.
+                        With no NAME, uses /sparkplayer_audio.
 ```
 
 Use `--graphics` to force a specific renderer when terminal auto-detection
 misses. On terminals such as Alacritty, only halfblocks will render — the
 terminal does not implement Sixel, Kitty, or iTerm2 inline images.
+
+### Bespoke shared-memory bridge
+
+`--bespoke-shm[=NAME]` publishes decoded audio to a stereo `f32` ring buffer for
+Bespoke/Awisp-style visualizer integrations. The bridge is opt-in and
+best-effort: if the mapping cannot be created, SparkPlayer prints a warning and
+continues without it.
+
+When `NAME` is omitted the stream name is `/sparkplayer_audio` on Unix-like
+systems and `Local\SparkPlayerAudio` on Windows. Only one SparkPlayer process
+may own a given name at a time; a second process using the same name disables
+its bridge instead of replacing or clearing the existing stream.
+
+The shared header starts with magic `SPRK`, version `1`, fixed stereo output,
+`sample_rate`, `write_frame`, `total_frames`, and `generation`. Consumers should
+read `generation` before and after copying the header/ring data and retry if it
+changed; SparkPlayer increments it when the stream is reset or the sample rate
+changes.
 
 ## Keyboard shortcuts
 
